@@ -26,11 +26,11 @@ async fn main() -> anyhow::Result<()> {
 
         println!("Accepted new connection from: {}", peer_addr);
 
-        // tokio::spawn(async move {
-        if let Err(e) = handle_connection(&mut socket).await {
-            eprintln!("Errror handling connection from {}: {:?}", peer_addr, e);
-        }
-        // });
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(&mut socket).await {
+                eprintln!("Errror handling connection from {}: {:?}", peer_addr, e);
+            }
+        });
     }
 }
 
@@ -52,7 +52,7 @@ async fn handle_connection(conn: &mut TcpStream) -> Result<()> {
             .context("Failed to write PONG response to TCP stream")?;
 
         if buf.is_empty() {
-            buf.clear(); // Clear the buffer if all data has been processed
+            buf.clear();
         }
     }
 
