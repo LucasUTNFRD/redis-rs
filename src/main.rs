@@ -1,7 +1,7 @@
 #![allow(unused_imports)]
 use std::{io::Write, net::TcpListener};
 
-const PONG_RESPONSE: &[u8] = b"=PONG\r\n";
+const PONG_RESPONSE: &[u8] = b"+PONG\r\n";
 
 fn main() {
     println!("Logs from your program will appear here!");
