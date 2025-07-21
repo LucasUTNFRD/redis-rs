@@ -3,6 +3,7 @@ use std::{
     str::from_utf8,
 };
 
+use anyhow::{bail, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -259,6 +260,12 @@ impl Encoder<RespDataType> for RespCodec {
 }
 
 impl RespDataType {
+    pub fn get_str(&self) -> anyhow::Result<String> {
+        match self {
+            RespDataType::BulkString(s) | RespDataType::SimpleString(s) => Ok(s.clone()),
+            _ => bail!("Expected string type"),
+        }
+    }
     pub fn as_bytes(&self) -> Bytes {
         match self {
             RespDataType::SimpleString(s) => {

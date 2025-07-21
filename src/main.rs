@@ -1,6 +1,11 @@
 #![allow(unused_imports)]
 
-use std::{collections::HashMap, sync::Arc};
+use core::str;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{bail, Context, Ok, Result};
 use bytes::BytesMut;
@@ -43,21 +48,146 @@ async fn main() -> anyhow::Result<()> {
 
 #[derive(Debug, Default, Clone)]
 struct KvStore {
-    inner: Arc<RwLock<HashMap<String, String>>>,
+    inner: Arc<RwLock<HashMap<String, Entry>>>,
+    instant: Duration,
+}
+
+#[derive(Debug, Default)]
+struct Entry {
+    pub val: String,
+    expires_at: Option<Instant>,
+}
+
+impl Entry {
+    pub fn new(val: String, expiry: Option<Duration>) -> Self {
+        Self {
+            val,
+            expires_at: expiry.map(|expiry| Instant::now() + expiry),
+        }
+    }
+
+    pub fn is_expired(&self, now: Instant) -> bool {
+        self.expires_at.is_some_and(|expiry| now > expiry)
+    }
 }
 
 impl KvStore {
-    pub async fn set(&self, key: String, value: String) -> RespDataType {
+    pub async fn set(&self, key: String, value: String, expiry: Option<Duration>) -> RespDataType {
         let mut store = self.inner.write().await;
-        store.insert(key, value);
+
+        store.insert(key, Entry::new(value, expiry));
         RespDataType::SimpleString("OK".into())
     }
 
-    pub async fn get(&self, key: String) -> RespDataType {
+    pub async fn get(&self, key: &str) -> RespDataType {
         let store = self.inner.read().await;
-        match store.get(&key) {
-            Some(val) => RespDataType::BulkString(val.clone()),
+        match store.get(key) {
+            Some(entry) if !entry.is_expired(Instant::now()) => {
+                RespDataType::BulkString(entry.val.clone())
+            }
+            Some(entry) => RespDataType::NullBulkString,
             None => RespDataType::NullBulkString,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Command {
+    Ping,
+    Echo(String),
+    Set {
+        key: String,
+        val: String,
+        px: Option<Duration>, // in milliseconds
+    },
+    Get {
+        key: String,
+    },
+}
+
+impl TryFrom<RespDataType> for Command {
+    type Error = anyhow::Error;
+    fn try_from(resp: RespDataType) -> std::result::Result<Self, Self::Error> {
+        match resp {
+            RespDataType::Array(parts) => {
+                if parts.is_empty() {
+                    bail!("Empty command array");
+                }
+
+                let cmd = match &parts[0] {
+                    RespDataType::BulkString(cmd) | RespDataType::SimpleString(cmd) => {
+                        cmd.to_uppercase()
+                    }
+                    _ => bail!("Command must be a string type"),
+                };
+
+                match cmd.as_str() {
+                    "PING" => {
+                        if parts.len() > 1 {
+                            bail!("PING command takes no arguments");
+                        }
+                        Ok(Command::Ping)
+                    }
+                    "ECHO" => {
+                        if parts.len() != 2 {
+                            bail!("ECHO command requires exactly 1 argument");
+                        }
+                        match &parts[1] {
+                            RespDataType::BulkString(msg) => Ok(Command::Echo(msg.clone())),
+                            _ => bail!("ECHO message must be a bulk string"),
+                        }
+                    }
+                    "GET" => {
+                        if parts.len() != 2 {
+                            bail!("GET command requires exactly 1 argument");
+                        }
+                        match &parts[1] {
+                            RespDataType::BulkString(key) => Ok(Command::Get { key: key.clone() }),
+                            _ => bail!("GET key must be a bulk string"),
+                        }
+                    }
+                    "SET" => {
+                        if parts.len() < 3 || parts.len() > 5 {
+                            bail!("SET command requires 2 or 4 arguments (key, value, [PX, milliseconds])");
+                        }
+
+                        let key = match &parts[1] {
+                            RespDataType::BulkString(key) => key.clone(),
+                            _ => bail!("SET key must be a bulk string"),
+                        };
+
+                        let val = match &parts[2] {
+                            RespDataType::BulkString(val) => val.clone(),
+                            _ => bail!("SET value must be a bulk string"),
+                        };
+
+                        let px = if parts.len() > 3 {
+                            match (&parts[3], parts.get(4)) {
+                                (
+                                    RespDataType::BulkString(opt),
+                                    Some(RespDataType::BulkString(ms)),
+                                ) => {
+                                    if opt.to_uppercase() == "PX" {
+                                        let milliseconds = ms
+                                            .parse::<u64>()
+                                            .context("PX value must be a valid number")?;
+                                        Some(Duration::from_millis(milliseconds))
+                                    } else {
+                                        bail!("Only PX option is supported for SET");
+                                    }
+                                }
+                                _ => bail!("Invalid SET options format"),
+                            }
+                        } else {
+                            None
+                        };
+
+                        Ok(Command::Set { key, val, px })
+                    }
+                    _ => bail!("Unknown command: {}", cmd),
+                }
+            }
+            _ => bail!("Command must be an array of RESP types"),
         }
     }
 }
@@ -67,81 +197,21 @@ async fn handle_connection(conn: &mut TcpStream, redis_state: &KvStore) -> Resul
 
     while let Some(resp_result) = framed.next().await {
         let resp_data = resp_result.context("Decoding failed")?;
-        match resp_data {
-            RespDataType::Array(ref parts) if !parts.is_empty() => match &parts[0] {
-                RespDataType::BulkString(cmd) | RespDataType::SimpleString(cmd) => {
-                    match cmd.to_uppercase().as_str() {
-                        "PING" => {
-                            let response = RespDataType::SimpleString("PONG".to_string());
-                            framed.send(response).await?;
-                        }
-                        "ECHO" => {
-                            if parts.len() > 1 {
-                                if let RespDataType::BulkString(msg) = &parts[1] {
-                                    let response = RespDataType::BulkString(msg.clone());
-                                    framed.send(response).await?;
-                                }
-                            }
-                        }
-                        "GET" => {
-                            if parts.len() == 2 {
-                                if let RespDataType::BulkString(key)
-                                | RespDataType::SimpleString(key) = &parts[1]
-                                {
-                                    let value = redis_state.get(key.clone()).await;
-                                    framed.send(value).await?;
-                                } else {
-                                    let response = RespDataType::SimpleError(
-                                        "ERR invalid key type".to_string(),
-                                    );
-                                    framed.send(response).await?;
-                                }
-                            } else {
-                                let response = RespDataType::SimpleError(
-                                    "ERR wrong number of arguments for 'get' command".to_string(),
-                                );
-                                framed.send(response).await?;
-                            }
-                        }
-                        "SET" => {
-                            if parts.len() == 3 {
-                                if let (
-                                    RespDataType::BulkString(key) | RespDataType::SimpleString(key),
-                                    RespDataType::BulkString(value)
-                                    | RespDataType::SimpleString(value),
-                                ) = (&parts[1], &parts[2])
-                                {
-                                    let response =
-                                        redis_state.set(key.clone(), value.clone()).await;
-                                    framed.send(response).await?;
-                                } else {
-                                    let response = RespDataType::SimpleError(
-                                        "ERR invalid argument types".to_string(),
-                                    );
-                                    framed.send(response).await?;
-                                }
-                            } else {
-                                let response = RespDataType::SimpleError(
-                                    "ERR wrong number of arguments for 'set' command".to_string(),
-                                );
-                                framed.send(response).await?;
-                            }
-                        }
-                        _ => {
-                            let response =
-                                RespDataType::SimpleError("ERR unknown command".to_string());
-                            framed.send(response).await?;
-                        }
-                    }
-                }
-                _ => {
-                    let response =
-                        RespDataType::SimpleError("ERR invalid command format".to_string());
-                    framed.send(response).await?;
-                }
-            },
-            _ => {
-                let response = RespDataType::SimpleError("ERR commands must be arrays".to_string());
+        match Command::try_from(resp_data)? {
+            Command::Ping => {
+                let response = RespDataType::SimpleString("PONG".to_string());
+                framed.send(response).await?;
+            }
+            Command::Echo(msg) => {
+                let response = RespDataType::BulkString(msg);
+                framed.send(response).await?;
+            }
+            Command::Set { key, val, px } => {
+                let response = redis_state.set(key, val, px).await;
+                framed.send(response).await?;
+            }
+            Command::Get { key } => {
+                let response = redis_state.get(&key).await;
                 framed.send(response).await?;
             }
         }
