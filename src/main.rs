@@ -1,14 +1,14 @@
 #![allow(unused_imports)]
-// use std::{io::Write, net::TcpListener};
 
-use anyhow::{Context, Ok, Result};
+use anyhow::{bail, Context, Ok, Result};
 use bytes::BytesMut;
+use codecrafters_redis::resp::{RespDataType, RespDecoder};
+use futures::{SinkExt, StreamExt};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-
-const PONG_RESPONSE: &[u8] = b"+PONG\r\n";
+use tokio_util::codec::Framed;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,24 +35,55 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn handle_connection(conn: &mut TcpStream) -> Result<()> {
-    let mut buf = BytesMut::with_capacity(512);
+    let mut framed = Framed::new(conn, RespDecoder);
+
     loop {
-        let bytes_read = conn
-            .read_buf(&mut buf)
-            .await
-            .context("failed to read from stream")?;
-
-        if bytes_read == 0 {
-            println!("Client disconnected.");
-            break;
-        }
-
-        conn.write_all(PONG_RESPONSE)
-            .await
-            .context("Failed to write PONG response to TCP stream")?;
-
-        if buf.is_empty() {
-            buf.clear();
+        tokio::select! {
+            resp_result = framed.next() => {
+                match resp_result {
+                    Some(resp) => {
+                        let resp_data= resp.context("Decoding failed")?;
+                        match resp_data {
+                            RespDataType::Array(ref parts) if !parts.is_empty() => {
+                                match &parts[0] {
+                                    RespDataType::BulkString(cmd) | RespDataType::SimpleString(cmd) => {
+                                        match cmd.to_uppercase().as_str() {
+                                            "PING" => {
+                                                let response = RespDataType::SimpleString("PONG".to_string());
+                                                framed.send(response).await?;
+                                            }
+                                            "ECHO" => {
+                                                if parts.len() > 1 {
+                                                    if let RespDataType::BulkString(msg) = &parts[1] {
+                                                        let response = RespDataType::BulkString(msg.clone());
+                                                        framed.send(response).await?;
+                                                    }
+                                                }
+                                            }
+                                                                                   _ => {
+                                                let response = RespDataType::SimpleError("ERR unknown command".to_string());
+                                                framed.send(response).await?;
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        let response = RespDataType::SimpleError("ERR invalid command format".to_string());
+                                        framed.send(response).await?;
+                                    }
+                                }
+                            }
+                            _ => {
+                                let response = RespDataType::SimpleError("ERR commands must be arrays".to_string());
+                                framed.send(response).await?;
+                            }
+                        }
+                    }
+                    None => {
+                        println!("Client disconnected.");
+                        break;
+                    }
+                }
+            }
         }
     }
 
