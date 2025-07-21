@@ -1,12 +1,15 @@
 #![allow(unused_imports)]
 
+use std::{collections::HashMap, sync::Arc};
+
 use anyhow::{bail, Context, Ok, Result};
 use bytes::BytesMut;
-use codecrafters_redis::resp::{RespDataType, RespDecoder};
+use codecrafters_redis::resp::{RespCodec, RespDataType};
 use futures::{SinkExt, StreamExt};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::RwLock,
 };
 use tokio_util::codec::Framed;
 
@@ -18,6 +21,8 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Failed to bind from addr")?;
 
+    let redis_state = KvStore::default();
+
     loop {
         let (mut socket, peer_addr) = listener
             .accept()
@@ -26,16 +31,39 @@ async fn main() -> anyhow::Result<()> {
 
         println!("Accepted new connection from: {}", peer_addr);
 
+        let state = redis_state.clone();
+
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(&mut socket).await {
+            if let Err(e) = handle_connection(&mut socket, &state).await {
                 eprintln!("Errror handling connection from {}: {:?}", peer_addr, e);
             }
         });
     }
 }
 
-async fn handle_connection(conn: &mut TcpStream) -> Result<()> {
-    let mut framed = Framed::new(conn, RespDecoder);
+#[derive(Debug, Default, Clone)]
+struct KvStore {
+    inner: Arc<RwLock<HashMap<String, String>>>,
+}
+
+impl KvStore {
+    pub async fn set(&self, key: String, value: String) -> RespDataType {
+        let mut store = self.inner.write().await;
+        store.insert(key, value);
+        RespDataType::SimpleString("OK".into())
+    }
+
+    pub async fn get(&self, key: String) -> RespDataType {
+        let store = self.inner.read().await;
+        match store.get(&key) {
+            Some(val) => RespDataType::BulkString(val.clone()),
+            None => RespDataType::NullBulkString,
+        }
+    }
+}
+
+async fn handle_connection(conn: &mut TcpStream, redis_state: &KvStore) -> Result<()> {
+    let mut framed = Framed::new(conn, RespCodec);
 
     loop {
         tokio::select! {
@@ -60,7 +88,36 @@ async fn handle_connection(conn: &mut TcpStream) -> Result<()> {
                                                     }
                                                 }
                                             }
-                                                                                   _ => {
+                                            "GET" => {
+                                                if parts.len() == 2 {
+                                                      if let RespDataType::BulkString(key) | RespDataType::SimpleString(key) = &parts[1] {
+                                                            let value = redis_state.get(key.clone()).await;
+                                                            framed.send(value).await?;
+                                                        } else {
+                                                            let response = RespDataType::SimpleError("ERR invalid key type".to_string());
+                                                            framed.send(response).await?;
+                                                        }
+                                            } else {
+                                                        let response = RespDataType::SimpleError("ERR wrong number of arguments for 'get' command".to_string());
+                                                        framed.send(response).await?;
+                                                }
+                                            }
+                                            "SET" => {
+                                                 if parts.len() == 3 {
+                                                         if let (RespDataType::BulkString(key) | RespDataType::SimpleString(key),
+                                                                 RespDataType::BulkString(value) | RespDataType::SimpleString(value)) = (&parts[1], &parts[2]) {
+                                                             let response = redis_state.set(key.clone(), value.clone()).await;
+                                                             framed.send(response).await?;
+                                                        } else {
+                                                            let response = RespDataType::SimpleError("ERR invalid argument types".to_string());
+                                                            framed.send(response).await?;
+                                                        }
+                                                 } else {
+                                                     let response = RespDataType::SimpleError("ERR wrong number of arguments for 'set' command".to_string());
+                                                     framed.send(response).await?;
+                                                 }
+                                            }
+                                            _ => {
                                                 let response = RespDataType::SimpleError("ERR unknown command".to_string());
                                                 framed.send(response).await?;
                                             }

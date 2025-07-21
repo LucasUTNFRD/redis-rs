@@ -6,13 +6,14 @@ use std::{
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-pub struct RespDecoder;
+pub struct RespCodec;
 
-impl RespDecoder {}
+impl RespCodec {}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RespDataType {
     BulkString(String),
+    NullBulkString,
     SimpleError(String),
     Array(Vec<RespDataType>),
     SimpleString(String),
@@ -22,26 +23,11 @@ const SIMPLE_STRING_BYTE: u8 = b'+';
 const ARRAY_BYTE: u8 = b'*';
 const BULK_STRING_BYTE: u8 = b'$';
 const ERROR_BYTE: u8 = b'-';
+const CRLF: &[u8] = b"\r\n";
 
 pub enum RespError {}
 
-// TODO:
-//
-//     We suggest that you implement a proper Redis protocol parser in this stage. It'll come in handy in later stages.
-//     Redis command names are case-insensitive, so ECHO, echo and EcHo are all valid commands.
-//     The tester will send a random string as an argument to the ECHO command, so you won't be able to hardcode the response to pass this stage.
-//     The exact bytes your program will receive won't be just ECHO hey, you'll receive something like this: *2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n. That's ["ECHO", "hey"] encoded using the Redis protocol.
-//     You can read more about how "commands" are handled in the Redis protocol here.
-//
-//
-// notes:
-// Clients send commands to a Redis server as an array of bulk strings.
-// The first (and sometimes also the second) bulk string in the array is the command's name.
-// Subsequent elements of the array are the arguments for the command.
-
-const CRLF: &[u8] = b"\r\n";
-
-impl Decoder for RespDecoder {
+impl Decoder for RespCodec {
     type Item = RespDataType;
     type Error = std::io::Error;
 
@@ -69,8 +55,8 @@ impl Decoder for RespDecoder {
                 }
             }
             BULK_STRING_BYTE => {
-                if let Some(bulk_str) = parse_bulk_str(src)? {
-                    Ok(Some(bulk_str))
+                if let Some(bulk_string) = parse_bulk_string(src)? {
+                    Ok(Some(bulk_string))
                 } else {
                     Ok(None)
                 }
@@ -85,8 +71,6 @@ fn find_crlf(src: &BytesMut) -> Option<usize> {
 }
 
 fn parse_simple_string(src: &mut BytesMut) -> Result<Option<RespDataType>, std::io::Error> {
-    dbg!(&src);
-
     if let Some(crlf_pos) = find_crlf(src) {
         // A simple string like "+\r\n" should be an error because it has no content.
         // The CRLF starts immediately after the type byte (index 1).
@@ -94,9 +78,15 @@ fn parse_simple_string(src: &mut BytesMut) -> Result<Option<RespDataType>, std::
             return Err(Error::new(ErrorKind::InvalidData, "Empty simple string"));
         }
 
-        let content = String::from_utf8_lossy(&src[1..crlf_pos]).to_string();
-        dbg!(&content);
-        src.advance(crlf_pos + 2); // Skip the content and CRLF
+        let content = from_utf8(&src[1..crlf_pos])
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "Invalid UTF-8 in bulk string length",
+                )
+            })?
+            .to_string();
+        src.advance(crlf_pos + CRLF.len()); // Skip the content and CRLF
         Ok(Some(RespDataType::SimpleString(content)))
     } else {
         Ok(None)
@@ -111,8 +101,15 @@ fn parse_simple_errors(src: &mut BytesMut) -> Result<Option<RespDataType>, std::
             return Err(Error::new(ErrorKind::InvalidData, "Empty simple string"));
         }
 
-        let content = String::from_utf8_lossy(&src[1..crlf_pos]).to_string();
-        src.advance(crlf_pos + 2); // Skip the content and CRLF
+        let content = from_utf8(&src[1..crlf_pos])
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "Invalid UTF-8 in bulk string length",
+                )
+            })?
+            .to_string();
+        src.advance(crlf_pos + CRLF.len()); // Skip the content and CRLF
         Ok(Some(RespDataType::SimpleError(content)))
     } else {
         Ok(None) // Need more data
@@ -127,26 +124,19 @@ fn parse_simple_errors(src: &mut BytesMut) -> Result<Option<RespDataType>, std::
 // The CRLF terminator.
 // The data.
 // A final CRLF.
-
-fn parse_bulk_str(src: &mut BytesMut) -> Result<Option<RespDataType>, std::io::Error> {
-    dbg!(&src);
+fn parse_bulk_string(src: &mut BytesMut) -> Result<Option<RespDataType>, std::io::Error> {
     // read string length
     if let Some(crlf_pos) = find_crlf(src) {
         if crlf_pos == 1 {
-            dbg!(&src, crlf_pos);
             return Err(Error::new(ErrorKind::InvalidData, "Empty simple string"));
         }
 
-        dbg!(&src, crlf_pos);
         let length_str = from_utf8(&src[1..crlf_pos]).map_err(|_| {
             Error::new(
                 ErrorKind::InvalidData,
                 "Invalid UTF-8 in bulk string length",
             )
         })?;
-        dbg!(&length_str);
-
-        // TODO : Use a custom error
 
         // Parse the length
         let length: isize = length_str
@@ -154,16 +144,24 @@ fn parse_bulk_str(src: &mut BytesMut) -> Result<Option<RespDataType>, std::io::E
             .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid bulk string length format"))?;
 
         if length == -1 {
-            todo!("implement null bulk string data type");
+            return Ok(Some(RespDataType::NullBulkString));
         }
 
         let data_len = length as usize;
         if src.len() < (crlf_pos + CRLF.len()) + data_len + CRLF.len() {
-            dbg!(src.len());
             return Ok(None);
         }
-        src.advance(crlf_pos + 2);
-        let content = String::from_utf8_lossy(&src[0..data_len]).to_string();
+        src.advance(crlf_pos + CRLF.len());
+
+        let content = from_utf8(&src[0..data_len])
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "Invalid UTF-8 in bulk string length",
+                )
+            })?
+            .to_string();
+
         src.advance(data_len + 2);
         Ok(Some(RespDataType::BulkString(content)))
     } else {
@@ -184,7 +182,6 @@ fn parse_bulk_str(src: &mut BytesMut) -> Result<Option<RespDataType>, std::io::E
 fn parse_array(src: &mut BytesMut) -> Result<Option<RespDataType>, std::io::Error> {
     if let Some(crlf_pos) = find_crlf(src) {
         if crlf_pos == 1 {
-            dbg!(&src, crlf_pos);
             return Err(Error::new(ErrorKind::InvalidData, "Empty simple string"));
         }
 
@@ -209,38 +206,40 @@ fn parse_array(src: &mut BytesMut) -> Result<Option<RespDataType>, std::io::Erro
 
         // advance from  *<number-of-elements>\r\n<element-1>...<element-n> to  <element-1>...<element-n>
         src.advance(crlf_pos + 2);
-        let mut i = num_elements;
-        while i > 0 {
-            dbg!(&src[0]);
-            dbg!(&array);
-            match src[0] {
+        for _ in 0..num_elements {
+            if src.is_empty() {
+                return Ok(None);
+            }
+
+            let first_byte = match src.first() {
+                Some(&byte) => byte,
+                None => return Ok(None),
+            };
+
+            match first_byte {
                 SIMPLE_STRING_BYTE => {
                     if let Some(simple_str) = parse_simple_string(src)? {
                         array.push(simple_str);
-                        dbg!(&src);
                     } else {
-                        todo!("handle this correctly")
+                        return Ok(None);
                     }
                 }
                 ARRAY_BYTE => {
                     if let Some(simple_str) = parse_array(src)? {
                         array.push(simple_str);
-                        dbg!(&src);
                     } else {
-                        todo!("handle this correctly")
+                        return Ok(None);
                     }
                 }
                 BULK_STRING_BYTE => {
-                    if let Some(simple_str) = parse_bulk_str(src)? {
+                    if let Some(simple_str) = parse_bulk_string(src)? {
                         array.push(simple_str);
-                        dbg!(&src);
                     } else {
-                        todo!("handle this correctly")
+                        return Ok(None);
                     }
                 }
-                _ => panic!(),
+                _ => return Err(Error::new(ErrorKind::InvalidData, "Invalid RESP data type")),
             }
-            i -= 1
         }
 
         Ok(Some(RespDataType::Array(array)))
@@ -250,7 +249,7 @@ fn parse_array(src: &mut BytesMut) -> Result<Option<RespDataType>, std::io::Erro
     }
 }
 
-impl Encoder<RespDataType> for RespDecoder {
+impl Encoder<RespDataType> for RespCodec {
     type Error = std::io::Error;
 
     fn encode(&mut self, item: RespDataType, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
@@ -290,7 +289,6 @@ impl RespDataType {
                 buf.put_slice(CRLF);
                 buf.freeze()
             }
-
             RespDataType::Array(arr) => {
                 let len_str = arr.len().to_string();
                 // Compute the length of the prefix: *<len>\r\n
@@ -311,6 +309,13 @@ impl RespDataType {
                     buf.put_slice(&b);
                 }
 
+                buf.freeze()
+            }
+            RespDataType::NullBulkString => {
+                let mut buf = BytesMut::with_capacity(1 + 1 + CRLF.len());
+                buf.put_u8(BULK_STRING_BYTE);
+                buf.put_slice(b"-1");
+                buf.put_slice(CRLF);
                 buf.freeze()
             }
         }
@@ -399,13 +404,13 @@ mod tests {
         let mut buf = bytes_from_str("-\r\n");
         let result = parse_simple_errors(&mut buf);
         assert!(result.is_err());
-        // assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidData);
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidData);
     }
 
     #[test]
     fn test_parse_bulk_string() {
         let mut buf = bytes_from_str("$3\r\nhey\r\n");
-        let result = parse_bulk_str(&mut buf).unwrap();
+        let result = parse_bulk_string(&mut buf).unwrap();
         if let Some(RespDataType::BulkString(s)) = result {
             assert_eq!(s, "hey");
         } else {
@@ -457,6 +462,14 @@ mod tests {
     fn test_encoded_array() {
         let expected_bytes = bytes_from_str("$4\r\nECHO\r\n");
         let resp_data_type = RespDataType::BulkString("ECHO".to_string());
+
+        assert_eq!(resp_data_type.as_bytes(), expected_bytes)
+    }
+
+    #[test]
+    fn test_encoded_null_bulk_str() {
+        let expected_bytes = bytes_from_str("$-1\r\n");
+        let resp_data_type = RespDataType::NullBulkString;
 
         assert_eq!(resp_data_type.as_bytes(), expected_bytes)
     }
