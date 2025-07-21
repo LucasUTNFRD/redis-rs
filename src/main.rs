@@ -63,15 +63,15 @@ async fn handle_connection(conn: &mut TcpStream, redis_state: &KvStore) -> Resul
                 framed.send(response).await?;
             }
             Command::Set { key, val, px } => {
-                let response = redis_state.set(key, val, px).await;
+                let response = redis_state.set(key, val, px);
                 framed.send(response).await?;
             }
             Command::Get { key } => {
-                let response = redis_state.get(&key).await;
+                let response = redis_state.get(&key);
                 framed.send(response).await?;
             }
             Command::RPush { key, elements } => {
-                let response = redis_state.rpush(key, elements).await;
+                let response = redis_state.rpush(key, elements);
                 framed.send(response).await?;
             }
         }

@@ -4,12 +4,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::sync::RwLock;
+use std::sync::RwLock;
 
 use crate::resp::RespDataType;
 
 #[derive(Debug, Default, Clone)]
 pub struct KvStore {
+    // Most Redis operations are simple HashMap gets/sets. Critical sections are very short. No Critical sections are very short
     inner: Arc<RwLock<HashMap<String, Entry>>>,
     instant: Duration,
 }
@@ -46,9 +47,16 @@ impl Entry {
     }
 }
 
+// note:
+// Redis handles expired keys through a combination of passive expiration and active expiration.
+// Both mechanisms primarily operate within Redis's single-threaded main event loop,
+
+// TODO::
+// Implement an Active Expiration mechanism.
+
 impl KvStore {
-    pub async fn set(&self, key: String, value: String, expiry: Option<Duration>) -> RespDataType {
-        let mut store = self.inner.write().await;
+    pub fn set(&self, key: String, value: String, expiry: Option<Duration>) -> RespDataType {
+        let mut store = self.inner.write().unwrap();
 
         store.insert(key, Entry::new(value, expiry));
         RespDataType::SimpleString("OK".into())
@@ -59,8 +67,8 @@ impl KvStore {
     // It is possible to push multiple elements using a single command call just specifying multiple arguments at the end of the command.
     // Elements are inserted one after the other to the tail of the list, from the leftmost element to the rightmost element.
     // So for instance the command RPUSH mylist a b c will result into a list containing a as first element, b as second element and c as third element.
-    pub async fn rpush(&self, key: String, values: Vec<String>) -> RespDataType {
-        let mut store = self.inner.write().await;
+    pub fn rpush(&self, key: String, values: Vec<String>) -> RespDataType {
+        let mut store = self.inner.write().unwrap();
         let entry = store
             .entry(key)
             .or_insert_with(|| Entry::new_list(VecDeque::new()));
@@ -76,8 +84,8 @@ impl KvStore {
         }
     }
 
-    pub async fn get(&self, key: &str) -> RespDataType {
-        let store = self.inner.read().await;
+    pub fn get(&self, key: &str) -> RespDataType {
+        let store = self.inner.read().unwrap();
         match store.get(key) {
             Some(entry) if !entry.is_expired(Instant::now()) => match &entry.val {
                 Value::String(s) => RespDataType::BulkString(s.clone()),
@@ -85,7 +93,17 @@ impl KvStore {
                     "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
                 ),
             },
-            Some(_) => RespDataType::NullBulkString,
+            Some(_) => {
+                drop(store);
+                let mut store = self.inner.write().unwrap();
+                //double-check in case that the entry expired while get rwlock
+                if let Some(entry) = store.get(key) {
+                    if entry.is_expired(Instant::now()) {
+                        store.remove(key);
+                    }
+                }
+                RespDataType::NullBulkString
+            }
             None => RespDataType::NullBulkString,
         }
     }
