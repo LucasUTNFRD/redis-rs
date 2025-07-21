@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -14,22 +14,35 @@ pub struct KvStore {
     instant: Duration,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Entry {
-    pub val: String,
+    pub val: Value,
     expires_at: Option<Instant>,
+}
+
+#[derive(Debug)]
+enum Value {
+    List(VecDeque<String>),
+    String(String),
 }
 
 impl Entry {
     pub fn new(val: String, expiry: Option<Duration>) -> Self {
         Self {
-            val,
+            val: Value::String(val),
             expires_at: expiry.map(|expiry| Instant::now() + expiry),
         }
     }
 
     pub fn is_expired(&self, now: Instant) -> bool {
         self.expires_at.is_some_and(|expiry| now > expiry)
+    }
+
+    pub fn new_list(elems: VecDeque<String>) -> Self {
+        Self {
+            val: Value::List(elems),
+            expires_at: None,
+        }
     }
 }
 
@@ -40,13 +53,38 @@ impl KvStore {
         store.insert(key, Entry::new(value, expiry));
         RespDataType::SimpleString("OK".into())
     }
+    // insert all the specified values at the tail of the list stored at key.
+    // If key does not exist, it is created as empty list before performing the push operation.
+    // When key holds a value that is not a list, an error is returned.
+    // It is possible to push multiple elements using a single command call just specifying multiple arguments at the end of the command.
+    // Elements are inserted one after the other to the tail of the list, from the leftmost element to the rightmost element.
+    // So for instance the command RPUSH mylist a b c will result into a list containing a as first element, b as second element and c as third element.
+    pub async fn rpush(&self, key: String, values: Vec<String>) -> RespDataType {
+        let mut store = self.inner.write().await;
+        let entry = store
+            .entry(key)
+            .or_insert_with(|| Entry::new_list(VecDeque::new()));
+
+        match &mut entry.val {
+            Value::List(list) => {
+                list.extend(values);
+                RespDataType::Integer(list.len() as i64)
+            }
+            _ => RespDataType::SimpleError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+            ),
+        }
+    }
 
     pub async fn get(&self, key: &str) -> RespDataType {
         let store = self.inner.read().await;
         match store.get(key) {
-            Some(entry) if !entry.is_expired(Instant::now()) => {
-                RespDataType::BulkString(entry.val.clone())
-            }
+            Some(entry) if !entry.is_expired(Instant::now()) => match &entry.val {
+                Value::String(s) => RespDataType::BulkString(s.clone()),
+                Value::List(_) => RespDataType::SimpleError(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
             Some(_) => RespDataType::NullBulkString,
             None => RespDataType::NullBulkString,
         }

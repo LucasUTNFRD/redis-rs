@@ -18,12 +18,14 @@ pub enum RespDataType {
     SimpleError(String),
     Array(Vec<RespDataType>),
     SimpleString(String),
+    Integer(i64),
 }
 
 const SIMPLE_STRING_BYTE: u8 = b'+';
 const ARRAY_BYTE: u8 = b'*';
 const BULK_STRING_BYTE: u8 = b'$';
 const ERROR_BYTE: u8 = b'-';
+const INTEGER_BYTE: u8 = b':';
 const CRLF: &[u8] = b"\r\n";
 
 pub enum RespError {}
@@ -41,29 +43,38 @@ impl Decoder for RespCodec {
         }
 
         match src[0] {
-            SIMPLE_STRING_BYTE => {
-                if let Some(simple_string) = parse_simple_string(src)? {
-                    Ok(Some(simple_string))
-                } else {
-                    Ok(None)
-                }
-            }
-            ARRAY_BYTE => {
-                if let Some(array) = parse_array(src)? {
-                    Ok(Some(array))
-                } else {
-                    Ok(None)
-                }
-            }
-            BULK_STRING_BYTE => {
-                if let Some(bulk_string) = parse_bulk_string(src)? {
-                    Ok(Some(bulk_string))
-                } else {
-                    Ok(None)
-                }
-            }
+            SIMPLE_STRING_BYTE => parse_simple_string(src),
+            ARRAY_BYTE => parse_array(src),
+            BULK_STRING_BYTE => parse_bulk_string(src),
+            INTEGER_BYTE => parse_integer(src),
+
             _ => Err(Error::new(ErrorKind::InvalidData, "Unknown RESP type byte")),
         }
+    }
+}
+
+// :[< + | - >]<value>\r\n
+//     The colon (:) as the first byte.
+//     An optional plus (+) or minus (-) as the sign.
+//     One or more decimal digits (0..9) as the integer's unsigned, base-10 value.
+//     The CRLF terminator.
+fn parse_integer(src: &mut BytesMut) -> Result<Option<RespDataType>, std::io::Error> {
+    if let Some(crlf_pos) = find_crlf(src) {
+        if crlf_pos == 1 {
+            return Err(Error::new(ErrorKind::InvalidData, "Empty integer"));
+        }
+
+        let integer_str = from_utf8(&src[1..crlf_pos])
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF-8 in integer string"))?;
+
+        let integer: i64 = integer_str
+            .parse()
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid integer format"))?;
+
+        src.advance(crlf_pos + CRLF.len());
+        Ok(Some(RespDataType::Integer(integer)))
+    } else {
+        Ok(None)
     }
 }
 
@@ -325,6 +336,15 @@ impl RespDataType {
                 buf.put_slice(CRLF);
                 buf.freeze()
             }
+            Self::Integer(int) => {
+                let int_str = int.to_string();
+                let len = 1 + int_str.len() + CRLF.len();
+                let mut buf = BytesMut::with_capacity(len);
+                buf.put_u8(INTEGER_BYTE);
+                buf.put_slice(int_str.as_bytes());
+                buf.put_slice(CRLF);
+                buf.freeze()
+            }
         }
     }
 }
@@ -454,6 +474,18 @@ mod tests {
         // Ensure buffer is consumed
         assert!(buf.is_empty());
     }
+    #[test]
+    fn test_parse_intger() {
+        let mut buf = bytes_from_str("$-1\r\n");
+        let result = parse_integer(&mut buf).unwrap();
+        if let Some(RespDataType::Integer(int)) = result {
+            assert_eq!(int, -1);
+        } else {
+            panic!("Expected array");
+        }
+        // Ensure buffer is consumed
+        assert!(buf.is_empty());
+    }
 
     #[test]
     fn test_encoded_bulk_str() {
@@ -477,6 +509,14 @@ mod tests {
     fn test_encoded_null_bulk_str() {
         let expected_bytes = bytes_from_str("$-1\r\n");
         let resp_data_type = RespDataType::NullBulkString;
+
+        assert_eq!(resp_data_type.as_bytes(), expected_bytes)
+    }
+
+    #[test]
+    fn test_encoded_integer() {
+        let expected_bytes = bytes_from_str(":-1\r\n");
+        let resp_data_type = RespDataType::Integer(-1);
 
         assert_eq!(resp_data_type.as_bytes(), expected_bytes)
     }

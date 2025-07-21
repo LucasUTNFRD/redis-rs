@@ -1,13 +1,13 @@
 #![allow(unused_imports)]
 
+use codecrafters_redis::cmd::Command;
+use codecrafters_redis::db::KvStore;
 use core::str;
 use std::{
     collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
-use codecrafters_redis::db::KvStore;
-use codecrafters_redis::cmd::Command;
 
 use anyhow::{bail, Context, Ok, Result};
 use bytes::BytesMut;
@@ -68,6 +68,10 @@ async fn handle_connection(conn: &mut TcpStream, redis_state: &KvStore) -> Resul
             }
             Command::Get { key } => {
                 let response = redis_state.get(&key).await;
+                framed.send(response).await?;
+            }
+            Command::RPush { key, elements } => {
+                let response = redis_state.rpush(key, elements).await;
                 framed.send(response).await?;
             }
         }

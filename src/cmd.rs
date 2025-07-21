@@ -16,6 +16,10 @@ pub enum Command {
     Get {
         key: String,
     },
+    RPush {
+        key: String,
+        elements: Vec<String>,
+    },
 }
 
 impl TryFrom<RespDataType> for Command {
@@ -96,6 +100,26 @@ impl TryFrom<RespDataType> for Command {
                         };
 
                         Ok(Command::Set { key, val, px })
+                    }
+                    "RPUSH" => {
+                        if parts.len() < 3 {
+                            bail!("RPush command requires 3 or more arguments RPUSH key element [element ...]");
+                        }
+
+                        let key = match &parts[1] {
+                            RespDataType::BulkString(key) => key.clone(),
+                            _ => bail!("RPUSH key must be a bulk string"),
+                        };
+
+                        let elements = parts[2..]
+                            .iter()
+                            .map(|p| match p {
+                                RespDataType::BulkString(s) => Ok(s.clone()),
+                                _ => bail!("RPUSH values must be bulk strings"),
+                            })
+                            .collect::<Result<Vec<String>, anyhow::Error>>()?;
+
+                        Ok(Command::RPush { key, elements })
                     }
                     _ => bail!("Unknown command: {}", cmd),
                 }
