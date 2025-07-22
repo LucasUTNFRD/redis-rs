@@ -30,6 +30,9 @@ pub enum Command {
         key: String,
         elements: Vec<String>,
     },
+    LLEN {
+        key: String,
+    },
 }
 
 impl TryFrom<RespDataType> for Command {
@@ -169,6 +172,15 @@ impl TryFrom<RespDataType> for Command {
                             .collect::<Result<Vec<String>, anyhow::Error>>()?;
 
                         Ok(Command::LPUSH { key, elements })
+                    }
+                    "LLEN" => {
+                        if parts.len() != 2 {
+                            bail!("LLEN command requires exactly 1 argument");
+                        }
+                        match &parts[1] {
+                            RespDataType::BulkString(key) => Ok(Command::LLEN { key: key.clone() }),
+                            _ => bail!("LLEN key must be a bulk string"),
+                        }
                     }
                     _ => bail!("Unknown command: {}", cmd),
                 }

@@ -58,6 +58,10 @@ async fn handle_connection(conn: &mut TcpStream, redis_state: &KvStore) -> Resul
                 let response = RespDataType::SimpleString("PONG".to_string());
                 framed.send(response).await?;
             }
+            Command::LLEN{key} => {
+                let response = redis_state.get_list_len(&key);
+                framed.send(response).await?;
+            }
             Command::ECHO(msg) => {
                 let response = RespDataType::BulkString(msg);
                 framed.send(response).await?;
@@ -83,6 +87,7 @@ async fn handle_connection(conn: &mut TcpStream, redis_state: &KvStore) -> Resul
                 let response = redis_state.lrange(key, start , stop );
                 framed.send(response).await?;
             }
+
         }
     }
 

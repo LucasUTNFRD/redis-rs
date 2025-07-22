@@ -141,6 +141,19 @@ impl KvStore {
         }
     }
 
+    pub fn get_list_len(&self, key: &str) -> RespDataType {
+        let store = self.inner.write().unwrap();
+        if let Some(entry) = store.get(key) {
+            match &entry.val {
+                Value::List(list) => RespDataType::Integer(list.len() as i64),
+                _ => RespDataType::SimpleError(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            }
+        } else {
+            RespDataType::Integer(0)
+        }
+    }
     pub fn get(&self, key: &str) -> RespDataType {
         let store = self.inner.read().unwrap();
         match store.get(key) {
