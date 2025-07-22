@@ -87,6 +87,10 @@ async fn handle_connection(conn: &mut TcpStream, redis_state: &KvStore) -> Resul
                 let response = redis_state.lrange(key, start , stop );
                 framed.send(response).await?;
             }
+            Command::LPOP{key,count} => {
+                let response = redis_state.left_pop(key,count);
+                framed.send(response).await?;
+            }
 
         }
     }

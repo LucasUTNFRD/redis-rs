@@ -62,6 +62,44 @@ impl KvStore {
         RespDataType::SimpleString("OK".into())
     }
 
+    // Nil reply: if the key does not exist.
+    // Bulk string reply: when called without the count argument, the value of the first element.
+    // Array reply: when called with the count argument, a list of popped elements.
+    pub fn left_pop(&self, key: String, count: Option<i64>) -> RespDataType {
+        let mut store = self.inner.write().unwrap();
+
+        let entry = match store.get_mut(&key) {
+            Some(e) => e,
+            None => return RespDataType::NullBulkString,
+        };
+
+        let list = match &mut entry.val {
+            Value::List(l) => l,
+            _ => return RespDataType::NullBulkString,
+        };
+
+        if list.is_empty() {
+            return RespDataType::NullBulkString;
+        }
+
+        match count {
+            Some(n) => {
+                // manage negative number
+                // TODO : check is usize is suitable
+                let n = n.max(0) as usize;
+                let elements = list
+                    .drain(..n.min(list.len()))
+                    .map(RespDataType::BulkString)
+                    .collect();
+                RespDataType::Array(elements)
+            }
+            None => {
+                let val = list.pop_front().unwrap(); // safe due to is_empty check
+                RespDataType::BulkString(val)
+            }
+        }
+    }
+
     pub fn lrange(&self, key: String, start: i64, stop: i64) -> RespDataType {
         let store = self.inner.read().unwrap();
         if let Some(entry) = store.get(&key) {

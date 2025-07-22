@@ -33,6 +33,10 @@ pub enum Command {
     LLEN {
         key: String,
     },
+    LPOP {
+        key: String,
+        count: Option<i64>,
+    },
 }
 
 impl TryFrom<RespDataType> for Command {
@@ -181,6 +185,27 @@ impl TryFrom<RespDataType> for Command {
                             RespDataType::BulkString(key) => Ok(Command::LLEN { key: key.clone() }),
                             _ => bail!("LLEN key must be a bulk string"),
                         }
+                    }
+                    "LPOP" => {
+                        if parts.len() < 2 || parts.len() > 3 {
+                            bail!("LPOP command requires 1 or 2 arguments (key, [count])");
+                        }
+
+                        let key = match &parts[1] {
+                            RespDataType::BulkString(key) => key.clone(),
+                            _ => bail!("LPOP key must be a bulk string"),
+                        };
+
+                        let count = if let Some(RespDataType::BulkString(s)) = parts.get(2) {
+                            Some(
+                                s.parse::<i64>()
+                                    .context("LPOP count mas be a valid integer")?,
+                            )
+                        } else {
+                            None
+                        };
+
+                        Ok(Command::LPOP { key, count })
                     }
                     _ => bail!("Unknown command: {}", cmd),
                 }
