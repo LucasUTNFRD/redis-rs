@@ -26,6 +26,10 @@ pub enum Command {
         start: i64,
         stop: i64,
     },
+    LPUSH {
+        key: String,
+        elements: Vec<String>,
+    },
 }
 
 impl TryFrom<RespDataType> for Command {
@@ -145,6 +149,26 @@ impl TryFrom<RespDataType> for Command {
                             (part_1, part_2, part_3) => bail!("LRANGE params must be a bulk string, got ({part_1:#?},{part_2:#?},{part_3:#?})"),
 
                         }
+                    }
+                    "LPUSH" => {
+                        if parts.len() < 3 {
+                            bail!("LPush command requires 3 or more arguments RPUSH key element [element ...]");
+                        }
+
+                        let key = match &parts[1] {
+                            RespDataType::BulkString(key) => key.clone(),
+                            _ => bail!("LPUSH key must be a bulk string"),
+                        };
+
+                        let elements = parts[2..]
+                            .iter()
+                            .map(|p| match p {
+                                RespDataType::BulkString(s) => Ok(s.clone()),
+                                _ => bail!("LPUSH values must be bulk strings"),
+                            })
+                            .collect::<Result<Vec<String>, anyhow::Error>>()?;
+
+                        Ok(Command::LPUSH { key, elements })
                     }
                     _ => bail!("Unknown command: {}", cmd),
                 }

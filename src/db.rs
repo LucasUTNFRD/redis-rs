@@ -68,27 +68,24 @@ impl KvStore {
             match &entry.val {
                 Value::List(list) => {
                     let len = list.len() as i64;
-                    let mut start = if start < 0 { len + start } else { start };
-                    let mut stop = if stop < 0 { len + stop } else { stop };
-                    if start < 0 {
-                        start = 0;
-                    }
-                    if stop < 0 {
-                        stop = 0;
-                    }
-                    if stop >= len {
-                        stop = len - 1;
-                    }
-                    if start >= len || start > stop {
+                    // Convert negative indices
+                    let start = if start < 0 { len + start } else { start };
+                    let stop = if stop < 0 { len + stop } else { stop };
+                    // Clamp to bounds
+                    let start = start.clamp(0, len);
+                    let stop = stop.clamp(0, len - 1);
+                    if start > stop || len == 0 {
                         return RespDataType::Array(vec![]);
                     }
 
+                    println!("Range : ({start}{stop})");
                     let elems = list
                         .range(start as usize..=stop as usize)
                         .cloned()
                         .map(RespDataType::BulkString)
-                        .collect::<Vec<RespDataType>>();
+                        .collect();
 
+                    println!("Ranged elems: ({elems:?})");
                     RespDataType::Array(elems)
                 }
 
@@ -116,6 +113,26 @@ impl KvStore {
         match &mut entry.val {
             Value::List(list) => {
                 list.extend(values);
+                RespDataType::Integer(list.len() as i64)
+            }
+            _ => RespDataType::SimpleError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+            ),
+        }
+    }
+
+    pub fn lpush(&self, key: String, values: Vec<String>) -> RespDataType {
+        let mut store = self.inner.write().unwrap();
+        let entry = store
+            .entry(key)
+            .or_insert_with(|| Entry::new_list(VecDeque::new()));
+
+        match &mut entry.val {
+            Value::List(list) => {
+                for v in values {
+                    list.push_front(v);
+                }
+
                 RespDataType::Integer(list.len() as i64)
             }
             _ => RespDataType::SimpleError(
