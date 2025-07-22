@@ -1,4 +1,4 @@
-use std::{ops::Range, time::Duration};
+use std::time::Duration;
 
 use anyhow::{bail, Context};
 
@@ -6,22 +6,22 @@ use crate::resp::RespDataType;
 
 #[derive(Debug, Clone)]
 pub enum Command {
-    Ping,
-    Echo(String),
-    Set {
+    PING,
+    ECHO(String),
+    SET {
         key: String,
         val: String,
         px: Option<Duration>, // in milliseconds
     },
-    Get {
+    GET {
         key: String,
     },
-    RPush {
+    RPUSH {
         key: String,
         elements: Vec<String>,
     },
     /// The LRANGE command is used to list the elements in a list given a start index and end index. The index of the first element 0. The end index is inclusive, which means that the element at the end index will be included in the response.
-    LRange {
+    LRANGE {
         key: String,
         start: i64,
         stop: i64,
@@ -49,14 +49,14 @@ impl TryFrom<RespDataType> for Command {
                         if parts.len() > 1 {
                             bail!("PING command takes no arguments");
                         }
-                        Ok(Command::Ping)
+                        Ok(Command::PING)
                     }
                     "ECHO" => {
                         if parts.len() != 2 {
                             bail!("ECHO command requires exactly 1 argument");
                         }
                         match &parts[1] {
-                            RespDataType::BulkString(msg) => Ok(Command::Echo(msg.clone())),
+                            RespDataType::BulkString(msg) => Ok(Command::ECHO(msg.clone())),
                             _ => bail!("ECHO message must be a bulk string"),
                         }
                     }
@@ -65,7 +65,7 @@ impl TryFrom<RespDataType> for Command {
                             bail!("GET command requires exactly 1 argument");
                         }
                         match &parts[1] {
-                            RespDataType::BulkString(key) => Ok(Command::Get { key: key.clone() }),
+                            RespDataType::BulkString(key) => Ok(Command::GET { key: key.clone() }),
                             _ => bail!("GET key must be a bulk string"),
                         }
                     }
@@ -105,7 +105,7 @@ impl TryFrom<RespDataType> for Command {
                             None
                         };
 
-                        Ok(Command::Set { key, val, px })
+                        Ok(Command::SET { key, val, px })
                     }
                     "RPUSH" => {
                         if parts.len() < 3 {
@@ -125,7 +125,7 @@ impl TryFrom<RespDataType> for Command {
                             })
                             .collect::<Result<Vec<String>, anyhow::Error>>()?;
 
-                        Ok(Command::RPush { key, elements })
+                        Ok(Command::RPUSH { key, elements })
                     }
                     "LRANGE" => {
                         // LRANGE key start stop
@@ -137,10 +137,10 @@ impl TryFrom<RespDataType> for Command {
                                 RespDataType::BulkString(key),
                                 RespDataType::BulkString(start),
                                 RespDataType::BulkString(stop),
-                            ) => Ok(Command::LRange {
+                            ) => Ok(Command::LRANGE{
                                 key: key.clone(),
-                                start: start.parse()?,
-                                stop: stop.parse()?,
+                                start: start.parse().context("Failed to parse Start ")?,
+                                stop: stop.parse().context("Failed to parse Stop")?,
                             }),
                             (part_1, part_2, part_3) => bail!("LRANGE params must be a bulk string, got ({part_1:#?},{part_2:#?},{part_3:#?})"),
 

@@ -54,29 +54,29 @@ async fn handle_connection(conn: &mut TcpStream, redis_state: &KvStore) -> Resul
     while let Some(resp_result) = framed.next().await {
         let resp_data = resp_result.context("Decoding failed")?;
         match Command::try_from(resp_data)? {
-            Command::Ping => {
+            Command::PING=> {
                 let response = RespDataType::SimpleString("PONG".to_string());
                 framed.send(response).await?;
             }
-            Command::Echo(msg) => {
+            Command::ECHO(msg) => {
                 let response = RespDataType::BulkString(msg);
                 framed.send(response).await?;
             }
-            Command::Set { key, val, px } => {
+            Command::SET{ key, val, px } => {
                 let response = redis_state.set(key, val, px);
                 framed.send(response).await?;
             }
-            Command::Get { key } => {
+            Command::GET{ key } => {
                 let response = redis_state.get(&key);
                 framed.send(response).await?;
             }
-            Command::RPush { key, elements } => {
+            Command::RPUSH { key, elements } => {
                 let response = redis_state.rpush(key, elements);
                 framed.send(response).await?;
             }
-            Command::LRange { key, start, stop } => {
+            Command::LRANGE { key, start, stop } => {
                 // for now is acceptable to trat i64 as usize
-                let response = redis_state.lrange(key, start as usize, stop as usize);
+                let response = redis_state.lrange(key, start , stop );
                 framed.send(response).await?;
             }
         }
