@@ -62,27 +62,29 @@ impl KvStore {
         RespDataType::SimpleString("OK".into())
     }
 
-    pub fn lrange(&self, key: String, start: usize, stop: usize) -> RespDataType {
+    pub fn lrange(&self, key: String, start: i64, stop: i64) -> RespDataType {
         let store = self.inner.read().unwrap();
         if let Some(entry) = store.get(&key) {
             match &entry.val {
                 Value::List(list) => {
-                    if start >= list.len() {
-                        return RespDataType::Array(vec![]);
+                    let len = list.len() as i64;
+                    let mut start = if start < 0 { len + start } else { start };
+                    let mut stop = if stop < 0 { len + stop } else { stop };
+                    if start < 0 {
+                        start = 0;
                     }
-
-                    let stop = if stop > list.len() {
-                        list.len() - 1
-                    } else {
-                        stop
-                    } + 1;
-
-                    if start > stop {
+                    if stop < 0 {
+                        stop = 0;
+                    }
+                    if stop >= len {
+                        stop = len - 1;
+                    }
+                    if start >= len || start > stop {
                         return RespDataType::Array(vec![]);
                     }
 
                     let elems = list
-                        .range(start..stop)
+                        .range(start as usize..=stop as usize)
                         .cloned()
                         .map(RespDataType::BulkString)
                         .collect::<Vec<RespDataType>>();
