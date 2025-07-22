@@ -74,6 +74,11 @@ async fn handle_connection(conn: &mut TcpStream, redis_state: &KvStore) -> Resul
                 let response = redis_state.rpush(key, elements);
                 framed.send(response).await?;
             }
+            Command::LRange { key, start, stop } => {
+                // for now is acceptable to trat i64 as usize
+                let response = redis_state.lrange(key, start as usize, stop as usize);
+                framed.send(response).await?;
+            }
         }
     }
 

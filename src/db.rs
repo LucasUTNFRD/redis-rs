@@ -61,6 +61,44 @@ impl KvStore {
         store.insert(key, Entry::new(value, expiry));
         RespDataType::SimpleString("OK".into())
     }
+
+    pub fn lrange(&self, key: String, start: usize, stop: usize) -> RespDataType {
+        let store = self.inner.read().unwrap();
+        if let Some(entry) = store.get(&key) {
+            match &entry.val {
+                Value::List(list) => {
+                    if start >= list.len() {
+                        return RespDataType::Array(vec![]);
+                    }
+
+                    let stop = if stop > list.len() {
+                        list.len() - 1
+                    } else {
+                        stop
+                    } + 1;
+
+                    if start > stop {
+                        return RespDataType::Array(vec![]);
+                    }
+
+                    let elems = list
+                        .range(start..stop)
+                        .cloned()
+                        .map(RespDataType::BulkString)
+                        .collect::<Vec<RespDataType>>();
+
+                    RespDataType::Array(elems)
+                }
+
+                _ => RespDataType::SimpleError(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            }
+        } else {
+            // if list does not exist an empty array is returned
+            RespDataType::Array(vec![])
+        }
+    }
     // insert all the specified values at the tail of the list stored at key.
     // If key does not exist, it is created as empty list before performing the push operation.
     // When key holds a value that is not a list, an error is returned.

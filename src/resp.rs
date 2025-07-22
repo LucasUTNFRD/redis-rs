@@ -489,6 +489,14 @@ mod tests {
 
     #[test]
     fn test_encoded_bulk_str() {
+        let expected_bytes = bytes_from_str("$4\r\nECHO\r\n");
+        let resp_data_type = RespDataType::BulkString("ECHO".to_string());
+
+        assert_eq!(resp_data_type.as_bytes(), expected_bytes)
+    }
+
+    #[test]
+    fn test_encoded_array() {
         let expected_bytes = bytes_from_str("*2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n");
         let resp_data_type = RespDataType::Array(vec![
             RespDataType::BulkString("ECHO".to_string()),
@@ -497,10 +505,11 @@ mod tests {
 
         assert_eq!(resp_data_type.as_bytes(), expected_bytes)
     }
+
     #[test]
-    fn test_encoded_array() {
-        let expected_bytes = bytes_from_str("$4\r\nECHO\r\n");
-        let resp_data_type = RespDataType::BulkString("ECHO".to_string());
+    fn test_enconde_empty_array() {
+        let expected_bytes = bytes_from_str("*0\r\n");
+        let resp_data_type = RespDataType::Array(vec![]);
 
         assert_eq!(resp_data_type.as_bytes(), expected_bytes)
     }

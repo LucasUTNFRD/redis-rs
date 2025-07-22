@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{ops::Range, time::Duration};
 
 use anyhow::{bail, Context};
 
@@ -19,6 +19,12 @@ pub enum Command {
     RPush {
         key: String,
         elements: Vec<String>,
+    },
+    /// The LRANGE command is used to list the elements in a list given a start index and end index. The index of the first element 0. The end index is inclusive, which means that the element at the end index will be included in the response.
+    LRange {
+        key: String,
+        start: i64,
+        stop: i64,
     },
 }
 
@@ -120,6 +126,25 @@ impl TryFrom<RespDataType> for Command {
                             .collect::<Result<Vec<String>, anyhow::Error>>()?;
 
                         Ok(Command::RPush { key, elements })
+                    }
+                    "LRANGE" => {
+                        // LRANGE key start stop
+                        if parts.len() != 4 {
+                            bail!("LRANGE LRANGE key start stop");
+                        }
+                        match (&parts[1], &parts[2], &parts[3]) {
+                            (
+                                RespDataType::BulkString(key),
+                                RespDataType::BulkString(start),
+                                RespDataType::BulkString(stop),
+                            ) => Ok(Command::LRange {
+                                key: key.clone(),
+                                start: start.parse()?,
+                                stop: stop.parse()?,
+                            }),
+                            (part_1, part_2, part_3) => bail!("LRANGE params must be a bulk string, got ({part_1:#?},{part_2:#?},{part_3:#?})"),
+
+                        }
                     }
                     _ => bail!("Unknown command: {}", cmd),
                 }
