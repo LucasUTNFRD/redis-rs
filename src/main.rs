@@ -58,6 +58,7 @@ async fn handle_connection(conn: &mut TcpStream, storage: StorageHandle) -> Resu
                     match cmd {
                         Command::EXEC if queued_cmds.is_empty() => {
                             framed.send(RespDataType::Array(vec![])).await?;
+                            transaction_queue = None
                         }
                         Command::EXEC => {
                             todo!()
