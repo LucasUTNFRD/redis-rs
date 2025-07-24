@@ -45,6 +45,7 @@ pub enum Command {
     INCR {
         key: String,
     },
+    MULTI,
 }
 
 impl TryFrom<RespDataType> for Command {
@@ -253,6 +254,12 @@ impl TryFrom<RespDataType> for Command {
                             RespDataType::BulkString(key) => Ok(Command::INCR { key: key.clone() }),
                             _ => bail!("GET key must be a bulk string"),
                         }
+                    }
+                    "MULTI" => {
+                        if parts.len() > 1 {
+                            bail!("MULTI command takes no arguments");
+                        }
+                        Ok(Command::MULTI)
                     }
                     _ => bail!("Unknown command: {}", cmd),
                 }

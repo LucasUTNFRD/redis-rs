@@ -47,6 +47,9 @@ async fn main() -> anyhow::Result<()> {
 async fn handle_connection(conn: &mut TcpStream, storage: StorageHandle) -> Result<()> {
     let mut framed = Framed::new(conn, RespCodec);
 
+    let cmd_pipeline: Option<Vec<Command>> = None;
+    let multi_flag = false;
+
     while let Some(resp_result) = framed.next().await {
         let resp_data = resp_result.context("Decoding failed")?;
         let cmd = Command::try_from(resp_data);
@@ -55,6 +58,7 @@ async fn handle_connection(conn: &mut TcpStream, storage: StorageHandle) -> Resu
                 let response = match cmd {
                     Command::PING => RespDataType::SimpleString("PONG".to_string()),
                     Command::ECHO(msg) => RespDataType::BulkString(msg),
+                    Command::MULTI => RespDataType::SimpleString("OK".into()),
                     _ => storage.send(cmd).await,
                 };
                 framed.send(response).await?;

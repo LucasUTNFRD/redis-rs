@@ -105,6 +105,7 @@ fn parse_simple_string(src: &mut BytesMut) -> Result<Option<RespDataType>, std::
     }
 }
 
+#[allow(dead_code)]
 fn parse_simple_errors(src: &mut BytesMut) -> Result<Option<RespDataType>, std::io::Error> {
     if let Some(crlf_pos) = find_crlf(src) {
         // A simple string like "+\r\n" should be an error because it has no content.

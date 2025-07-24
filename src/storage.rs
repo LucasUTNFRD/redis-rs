@@ -65,6 +65,9 @@ impl StorageActor {
                     let response = self.string_store.increment(key);
                     let _ = response_tx.send(response);
                 }
+                // Command::MULTI => {
+                //     let _ = response_tx.send(RespDataType::SimpleString("OK".into()));
+                // }
                 _ => {
                     let _ = response_tx
                         .send(RespDataType::SimpleError("Unsupported command".to_string()));
