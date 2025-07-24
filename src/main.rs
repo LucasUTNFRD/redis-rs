@@ -61,7 +61,10 @@ async fn handle_connection(conn: &mut TcpStream, storage: StorageHandle) -> Resu
                             transaction_queue = None
                         }
                         Command::EXEC => {
-                            todo!()
+                            let response = execute_transaction(queued_cmds, &storage).await;
+                            framed
+                                .send(RespDataType::SimpleString("QUEUED".into()))
+                                .await?;
                         }
                         _ => {
                             queued_cmds.push_back(cmd);
@@ -92,4 +95,25 @@ async fn handle_connection(conn: &mut TcpStream, storage: StorageHandle) -> Resu
     }
 
     Ok(())
+}
+
+async fn execute_transaction(
+    queued_cmds: &mut VecDeque<Command>,
+    storage: &StorageHandle,
+) -> RespDataType {
+    let mut results = Vec::with_capacity(queued_cmds.len());
+
+    while let Some(cmd) = queued_cmds.pop_front() {
+        let result = match cmd {
+            Command::PING => RespDataType::SimpleString("PONG".to_string()),
+            Command::ECHO(msg) => RespDataType::BulkString(msg),
+            Command::EXEC | Command::MULTI => panic!("MULTIPLE or EXEC could not be queued"),
+            // Note: MULTI/EXEC/DISCARD inside transactions should be handled specially
+            // For now, treat them as storage commands
+            _ => storage.send(cmd).await,
+        };
+        results.push(result);
+    }
+
+    RespDataType::Array(results)
 }
