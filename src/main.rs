@@ -1,22 +1,12 @@
 #![allow(unused_imports)]
 
 use codecrafters_redis::{cmd::Command, storage::StorageHandle};
-use core::str;
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::collections::VecDeque;
 
-use anyhow::{bail, Context, Result};
-use bytes::BytesMut;
+use anyhow::{Context, Result};
 use codecrafters_redis::resp::{RespCodec, RespDataType};
 use futures::{SinkExt, StreamExt};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-    sync::{oneshot, RwLock},
-};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
 #[tokio::main]
@@ -113,6 +103,7 @@ async fn execute_transaction(
             // For now, treat them as storage commands
             _ => storage.send(cmd).await,
         };
+
         results.push(result);
     }
 
