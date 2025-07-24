@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    sync::RwLock,
     time::{Duration, Instant},
 };
 
@@ -8,7 +7,7 @@ use crate::resp::RespDataType;
 
 #[derive(Default)]
 pub struct Strings {
-    inner: RwLock<HashMap<String, Value>>,
+    inner: HashMap<String, Value>,
 }
 
 struct Value {
@@ -29,26 +28,52 @@ impl Value {
 }
 
 impl Strings {
-    pub fn set(&self, key: String, value: String, expiry: Option<Duration>) -> RespDataType {
-        let mut store = self.inner.write().unwrap();
-
-        store.insert(key, Value::new(value, expiry));
+    pub fn set(&mut self, key: String, value: String, expiry: Option<Duration>) -> RespDataType {
+        self.inner.insert(key, Value::new(value, expiry));
         RespDataType::SimpleString("OK".into())
     }
 
-    pub fn get(&self, key: &str) -> RespDataType {
-        let store = self.inner.read().unwrap();
-        match store.get(key) {
+    pub fn increment(&mut self, key: String) -> RespDataType {
+        match self.inner.get_mut(&key) {
+            Some(entry) if !entry.is_expired(Instant::now()) => {
+                // Try to parse the current value as an integer
+                match entry.data.parse::<i64>() {
+                    Ok(current_value) => {
+                        let new_value = current_value + 1;
+                        entry.data = new_value.to_string();
+                        RespDataType::Integer(new_value)
+                    }
+                    Err(_) => {
+                        // Key exists but value is not a valid integer
+                        // This will be handled in later stages
+                        RespDataType::SimpleError(
+                            "ERR value is not an integer or out of range".into(),
+                        )
+                    }
+                }
+            }
+            Some(_) => {
+                // Key exists but is expired - remove it and treat as non-existent
+                self.inner.remove(&key);
+                // This will be handled in later stages (key doesn't exist)
+                RespDataType::SimpleError("Key expired - later stage".into())
+            }
+            None => {
+                // Key doesn't exist - this will be handled in later stages
+                RespDataType::SimpleError("Key doesn't exist - later stage".into())
+            }
+        }
+    }
+
+    pub fn get(&mut self, key: &str) -> RespDataType {
+        match self.inner.get(key) {
             Some(entry) if !entry.is_expired(Instant::now()) => {
                 RespDataType::BulkString(entry.data.clone())
             }
             Some(_) => {
-                drop(store);
-                let mut store = self.inner.write().unwrap();
-                //double-check in case that the entry expired while get rwlock
-                if let Some(entry) = store.get(key) {
+                if let Some(entry) = self.inner.get(key) {
                     if entry.is_expired(Instant::now()) {
-                        store.remove(key);
+                        self.inner.remove(key);
                     }
                 }
                 RespDataType::NullBulkString

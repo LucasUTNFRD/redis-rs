@@ -37,9 +37,13 @@ pub enum Command {
         key: String,
         count: Option<i64>,
     },
+    // NOT implemented
     BLPOP {
         keys: Vec<String>,
         timeout: Duration,
+    },
+    INCR {
+        key: String,
     },
 }
 
@@ -240,6 +244,15 @@ impl TryFrom<RespDataType> for Command {
                         let timeout = Duration::from_secs(timeout);
 
                         Ok(Command::BLPOP { keys, timeout })
+                    }
+                    "INCR" => {
+                        if parts.len() != 2 {
+                            bail!("INCR command requires exactly 1 argument");
+                        }
+                        match &parts[1] {
+                            RespDataType::BulkString(key) => Ok(Command::INCR { key: key.clone() }),
+                            _ => bail!("GET key must be a bulk string"),
+                        }
                     }
                     _ => bail!("Unknown command: {}", cmd),
                 }

@@ -61,6 +61,10 @@ impl StorageActor {
                 } => {
                     unimplemented!()
                 }
+                Command::INCR { key } => {
+                    let response = self.string_store.increment(key);
+                    let _ = response_tx.send(response);
+                }
                 _ => {
                     let _ = response_tx
                         .send(RespDataType::SimpleError("Unsupported command".to_string()));
