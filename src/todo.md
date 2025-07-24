@@ -1,3 +1,4 @@
 - [ ] Bench the current implementation with redis
 - [ ] Finish implemeting BLPOP 
 - [ ] Improve parsing by doing it zero-allocation
+- [ ] Implenet a redis client for testing
