@@ -55,16 +55,20 @@ async fn handle_connection(conn: &mut TcpStream, storage: StorageHandle) -> Resu
         match cmd {
             Ok(cmd) => {
                 if let Some(ref mut queued_cmds) = transaction_queue {
-                    if !matches!(cmd, Command::EXEC) {
-                        // whie let Some(cmd) = queued_cmds.pop_back() {
-                        // match cmd {
-                        //
-                        //     }
+                    match cmd {
+                        Command::EXEC if queued_cmds.is_empty() => {
+                            framed.send(RespDataType::Array(vec![])).await?;
+                        }
+                        Command::EXEC => {
+                            todo!()
+                        }
+                        _ => {
+                            queued_cmds.push_back(cmd);
+                            framed
+                                .send(RespDataType::SimpleString("QUEUED".into()))
+                                .await?;
+                        }
                     }
-                    queued_cmds.push_back(cmd);
-                    framed
-                        .send(RespDataType::SimpleString("QUEUED".into()))
-                        .await?;
                 } else {
                     let response = match cmd {
                         Command::PING => RespDataType::SimpleString("PONG".to_string()),
