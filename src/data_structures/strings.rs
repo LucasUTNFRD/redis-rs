@@ -59,8 +59,9 @@ impl Strings {
                 RespDataType::SimpleError("Key expired - later stage".into())
             }
             None => {
-                // Key doesn't exist - this will be handled in later stages
-                RespDataType::SimpleError("Key doesn't exist - later stage".into())
+                let default_value = Value::new(1.to_string(), None);
+                self.inner.insert(key, default_value);
+                RespDataType::Integer(1)
             }
         }
     }
