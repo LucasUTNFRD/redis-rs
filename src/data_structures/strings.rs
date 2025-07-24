@@ -27,6 +27,8 @@ impl Value {
     }
 }
 
+const NON_VALID_INTEGER_ERROR: &str = "ERR value is not an integer or out of range";
+
 impl Strings {
     pub fn set(&mut self, key: String, value: String, expiry: Option<Duration>) -> RespDataType {
         self.inner.insert(key, Value::new(value, expiry));
@@ -43,22 +45,10 @@ impl Strings {
                         entry.data = new_value.to_string();
                         RespDataType::Integer(new_value)
                     }
-                    Err(_) => {
-                        // Key exists but value is not a valid integer
-                        // This will be handled in later stages
-                        RespDataType::SimpleError(
-                            "ERR value is not an integer or out of range".into(),
-                        )
-                    }
+                    Err(_) => RespDataType::SimpleError(NON_VALID_INTEGER_ERROR.into()),
                 }
             }
-            Some(_) => {
-                // Key exists but is expired - remove it and treat as non-existent
-                self.inner.remove(&key);
-                // This will be handled in later stages (key doesn't exist)
-                RespDataType::SimpleError("Key expired - later stage".into())
-            }
-            None => {
+            Some(_) | None => {
                 let default_value = Value::new(1.to_string(), None);
                 self.inner.insert(key, default_value);
                 RespDataType::Integer(1)
