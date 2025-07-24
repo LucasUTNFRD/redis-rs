@@ -47,6 +47,7 @@ pub enum Command {
     },
     MULTI,
     EXEC,
+    DISCARD,
 }
 
 impl TryFrom<RespDataType> for Command {
@@ -268,6 +269,13 @@ impl TryFrom<RespDataType> for Command {
                             bail!("EXEC command takes no arguments");
                         }
                         Ok(Command::EXEC)
+                    }
+
+                    "DISCARD" => {
+                        if parts.len() > 1 {
+                            bail!("DISCARD command takes no arguments");
+                        }
+                        Ok(Command::DISCARD)
                     }
                     _ => bail!("Unknown command: {}", cmd),
                 }

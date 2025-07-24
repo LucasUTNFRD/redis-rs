@@ -60,6 +60,10 @@ async fn handle_connection(conn: &mut TcpStream, storage: StorageHandle) -> Resu
                             transaction_queue = None;
                             RespDataType::Array(vec![])
                         }
+                        Command::DISCARD => {
+                            transaction_queue = None;
+                            RespDataType::SimpleString("OK".into())
+                        }
                         Command::EXEC => execute_transaction(queued_cmds, &storage).await,
                         _ => {
                             queued_cmds.push_back(cmd);
@@ -76,6 +80,9 @@ async fn handle_connection(conn: &mut TcpStream, storage: StorageHandle) -> Resu
                             RespDataType::SimpleString("OK".into())
                         }
                         Command::EXEC => RespDataType::SimpleError("ERR EXEC without MULTI".into()),
+                        Command::DISCARD => {
+                            RespDataType::SimpleError("ERR DISCARD without MULTI".into())
+                        }
                         _ => storage.send(cmd).await,
                     };
                     framed.send(response).await?;
