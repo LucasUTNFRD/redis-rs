@@ -46,6 +46,7 @@ pub enum Command {
         key: String,
     },
     MULTI,
+    EXEC,
 }
 
 impl TryFrom<RespDataType> for Command {
@@ -260,6 +261,13 @@ impl TryFrom<RespDataType> for Command {
                             bail!("MULTI command takes no arguments");
                         }
                         Ok(Command::MULTI)
+                    }
+
+                    "EXEC" => {
+                        if parts.len() > 1 {
+                            bail!("EXEC command takes no arguments");
+                        }
+                        Ok(Command::EXEC)
                     }
                     _ => bail!("Unknown command: {}", cmd),
                 }

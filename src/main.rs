@@ -3,7 +3,7 @@
 use codecrafters_redis::{cmd::Command, storage::StorageHandle};
 use core::str;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -47,21 +47,37 @@ async fn main() -> anyhow::Result<()> {
 async fn handle_connection(conn: &mut TcpStream, storage: StorageHandle) -> Result<()> {
     let mut framed = Framed::new(conn, RespCodec);
 
-    let cmd_pipeline: Option<Vec<Command>> = None;
-    let multi_flag = false;
+    let mut transaction_queue: Option<VecDeque<Command>> = None;
 
     while let Some(resp_result) = framed.next().await {
         let resp_data = resp_result.context("Decoding failed")?;
         let cmd = Command::try_from(resp_data);
         match cmd {
             Ok(cmd) => {
-                let response = match cmd {
-                    Command::PING => RespDataType::SimpleString("PONG".to_string()),
-                    Command::ECHO(msg) => RespDataType::BulkString(msg),
-                    Command::MULTI => RespDataType::SimpleString("OK".into()),
-                    _ => storage.send(cmd).await,
-                };
-                framed.send(response).await?;
+                if let Some(ref mut queued_cmds) = transaction_queue {
+                    if !matches!(cmd, Command::EXEC) {
+                        // whie let Some(cmd) = queued_cmds.pop_back() {
+                        // match cmd {
+                        //
+                        //     }
+                    }
+                    queued_cmds.push_back(cmd);
+                    framed
+                        .send(RespDataType::SimpleString("QUEUED".into()))
+                        .await?;
+                } else {
+                    let response = match cmd {
+                        Command::PING => RespDataType::SimpleString("PONG".to_string()),
+                        Command::ECHO(msg) => RespDataType::BulkString(msg),
+                        Command::MULTI => {
+                            transaction_queue = Some(VecDeque::new());
+                            RespDataType::SimpleString("OK".into())
+                        }
+                        Command::EXEC => RespDataType::SimpleError("ERR EXEC without MULTI".into()),
+                        _ => storage.send(cmd).await,
+                    };
+                    framed.send(response).await?;
+                }
             }
             Err(e) => {
                 eprintln!("Command error: {}", e);
