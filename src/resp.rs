@@ -494,7 +494,6 @@ mod tests {
 
         assert_eq!(resp_data_type.as_bytes(), expected_bytes)
     }
-
     #[test]
     fn test_encoded_array() {
         let expected_bytes = bytes_from_str("*2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n");

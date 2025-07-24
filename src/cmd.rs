@@ -37,6 +37,10 @@ pub enum Command {
         key: String,
         count: Option<i64>,
     },
+    BLPOP {
+        keys: Vec<String>,
+        timeout: Duration,
+    },
 }
 
 impl TryFrom<RespDataType> for Command {
@@ -206,6 +210,36 @@ impl TryFrom<RespDataType> for Command {
                         };
 
                         Ok(Command::LPOP { key, count })
+                    }
+
+                    "BLPOP" => {
+                        if parts.len() < 2 {
+                            bail!("BLPOP requires at least one key and a timeout");
+                        }
+
+                        // All elements except the last are keys
+                        let keys = parts[1..parts.len() - 1]
+                            .iter()
+                            .map(|p| match p {
+                                RespDataType::BulkString(key) => Ok(key.clone()),
+                                _ => bail!("BLPOP keys must be bulk strings"),
+                            })
+                            .collect::<Result<Vec<String>, anyhow::Error>>()?;
+
+                        if keys.is_empty() {
+                            bail!("BLPOP requires at least one key");
+                        }
+
+                        let timeout = match &parts[parts.len() - 1] {
+                            RespDataType::BulkString(timeout_str) => timeout_str
+                                .parse::<u64>()
+                                .context("Timeout must be a valid unsigned integer")?,
+                            _ => bail!("Timeout must be a bulk string"),
+                        };
+
+                        let timeout = Duration::from_secs(timeout);
+
+                        Ok(Command::BLPOP { keys, timeout })
                     }
                     _ => bail!("Unknown command: {}", cmd),
                 }

@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 
-use codecrafters_redis::cmd::Command;
-use codecrafters_redis::db::KvStore;
+use codecrafters_redis::{cmd::Command, storage::StorageHandle};
 use core::str;
 use std::{
     collections::HashMap,
@@ -9,14 +8,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Context, Ok, Result};
+use anyhow::{bail, Context, Result};
 use bytes::BytesMut;
 use codecrafters_redis::resp::{RespCodec, RespDataType};
 use futures::{SinkExt, StreamExt};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::RwLock,
+    sync::{oneshot, RwLock},
 };
 use tokio_util::codec::Framed;
 
@@ -28,71 +27,43 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Failed to bind from addr")?;
 
-    let redis_state = KvStore::default();
+    let storage_handle = StorageHandle::new();
 
     loop {
-        let (mut socket, peer_addr) = listener
-            .accept()
-            .await
-            .context("Failed to accept incoming connection")?; // Use anyhow::Context for errors
+        let (mut socket, peer_addr) = listener.accept().await?;
 
         println!("Accepted new connection from: {}", peer_addr);
 
-        let state = redis_state.clone();
+        let storage = storage_handle.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(&mut socket, &state).await {
+            if let Err(e) = handle_connection(&mut socket, storage).await {
                 eprintln!("Errror handling connection from {}: {:?}", peer_addr, e);
             }
         });
     }
 }
 
-async fn handle_connection(conn: &mut TcpStream, redis_state: &KvStore) -> Result<()> {
+async fn handle_connection(conn: &mut TcpStream, storage: StorageHandle) -> Result<()> {
     let mut framed = Framed::new(conn, RespCodec);
 
     while let Some(resp_result) = framed.next().await {
         let resp_data = resp_result.context("Decoding failed")?;
-        match Command::try_from(resp_data)? {
-            Command::PING=> {
-                let response = RespDataType::SimpleString("PONG".to_string());
+        let cmd = Command::try_from(resp_data);
+        match cmd {
+            Ok(cmd) => {
+                let response = match cmd {
+                    Command::PING => RespDataType::SimpleString("PONG".to_string()),
+                    Command::ECHO(msg) => RespDataType::BulkString(msg),
+                    _ => storage.send(cmd).await,
+                };
                 framed.send(response).await?;
             }
-            Command::LLEN{key} => {
-                let response = redis_state.get_list_len(&key);
-                framed.send(response).await?;
+            Err(e) => {
+                eprintln!("Command error: {}", e);
+                let _ = framed.send(RespDataType::SimpleError(e.to_string())).await;
             }
-            Command::ECHO(msg) => {
-                let response = RespDataType::BulkString(msg);
-                framed.send(response).await?;
-            }
-            Command::SET{ key, val, px } => {
-                let response = redis_state.set(key, val, px);
-                framed.send(response).await?;
-            }
-            Command::GET{ key } => {
-                let response = redis_state.get(&key);
-                framed.send(response).await?;
-            }
-            Command::LPUSH { key, elements } => {
-                let response = redis_state.lpush(key, elements);
-                framed.send(response).await?;
-            }
-            Command::RPUSH { key, elements } => {
-                let response = redis_state.rpush(key, elements);
-                framed.send(response).await?;
-            }
-            Command::LRANGE { key, start, stop } => {
-                // for now is acceptable to trat i64 as usize
-                let response = redis_state.lrange(key, start , stop );
-                framed.send(response).await?;
-            }
-            Command::LPOP{key,count} => {
-                let response = redis_state.left_pop(key,count);
-                framed.send(response).await?;
-            }
-
-        }
+        };
     }
 
     Ok(())
