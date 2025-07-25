@@ -20,7 +20,9 @@ pub enum Command {
         key: String,
         elements: Vec<String>,
     },
-    /// The LRANGE command is used to list the elements in a list given a start index and end index. The index of the first element 0. The end index is inclusive, which means that the element at the end index will be included in the response.
+    /// The LRANGE command is used to list the elements in a list given a start index and end index.
+    /// The index of the first element 0.
+    /// The end index is inclusive, which means that the element at the end index will be included in the response.
     LRANGE {
         key: String,
         start: i64,

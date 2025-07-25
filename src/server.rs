@@ -6,8 +6,10 @@ use futures::{SinkExt, StreamExt};
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, RwLock};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
+use tracing::{debug, info};
 
 /// Represents a Redis server that handles client connections
 pub struct RedisServer {
@@ -33,50 +35,108 @@ impl RedisServer {
         })
     }
 
-    async fn send_handshake(&self, addr: &str) -> Result<()> {
-        let stream = TcpStream::connect(addr).await?;
+    /// Performs the complete replication handshake with a Redis master
+    ///
+    /// This implements the Redis replication protocol handshake sequence:
+    /// 1. PING - Test connectivity
+    /// 2. REPLCONF listening-port <port> - Inform master of our listening port
+    /// 3. REPLCONF capa psync2 - Announce PSYNC2 capability
+    /// 4. PSYNC ? -1 - Request full synchronization
+    async fn perform_replication_handshake(&self, addr: &str) -> Result<()> {
+        let stream = TcpStream::connect(addr)
+            .await
+            .context("Failed to connect to master")?;
         let mut framed = Framed::new(stream, RespCodec);
 
-        // #1 send ping command
+        info!("Starting replication handshake with master at {}", addr);
+
+        // Step 1: Send PING to test connectivity
         let ping = RespDataType::Array(vec![RespDataType::BulkString("PING".into())]);
-        framed.send(ping).await?;
 
-        // TODO : remove .unwrap()
-        // assert is pong
-        let response = framed.next().await.unwrap().unwrap();
-        // println!("recv:{response:?}");
+        framed
+            .send(ping)
+            .await
+            .context("Failed to send PING to master")?;
 
-        let first_replconf = RespDataType::Array(vec![
-            RespDataType::BulkString("REPLCONF".to_string()),
-            RespDataType::BulkString("listening-port".to_string()),
-            RespDataType::BulkString("6380".to_string()),
-        ]);
+        let response = framed
+            .next()
+            .await
+            .context("No response from master for PING")?
+            .context("Failed to decode PING response")?;
+        debug!("Received PING response: {:?}", response);
 
-        framed.send(first_replconf).await?;
+        // Step 2: Send REPLCONF commands
+        self.send_replconf(&mut framed, "listening-port", "6380")
+            .await
+            .context("Failed to send listening-port REPLCONF")?;
 
-        let response = framed.next().await.unwrap().unwrap();
-        // println!("recv:{response:?}");
+        self.send_replconf(&mut framed, "capa", "psync2")
+            .await
+            .context("Failed to send capa REPLCONF")?;
 
-        let second_replconf = RespDataType::Array(vec![
-            RespDataType::BulkString("REPLCONF".to_string()),
-            RespDataType::BulkString("capa".to_string()),
-            RespDataType::BulkString("psync2".to_string()),
-        ]);
-        framed.send(second_replconf).await?;
-        let response = framed.next().await.unwrap().unwrap();
-        // println!("recv:{response:?}");
-        //
+        // Step 3: Send PSYNC for full synchronization
+        self.send_psync(&mut framed)
+            .await
+            .context("Failed to send PSYNC")?;
+
+        info!("Replication handshake completed successfully");
+        Ok(())
+    }
+
+    /// Sends a PSYNC command to request synchronization with the master
+    ///
+    /// PSYNC ? -1 requests a full synchronization since we don't have any
+    /// previous replication state (? for unknown replication ID, -1 for unknown offset).
+    async fn send_psync(&self, framed: &mut Framed<TcpStream, RespCodec>) -> Result<()> {
         let psync = RespDataType::Array(vec![
             RespDataType::BulkString("PSYNC".to_string()),
             RespDataType::BulkString("?".to_string()),
             RespDataType::BulkString("-1".to_string()),
         ]);
 
-        framed.send(psync).await?;
+        framed
+            .send(psync)
+            .await
+            .context("Failed to send PSYNC command")?;
 
-        let response = framed.next().await.unwrap().unwrap();
-        println!("Connected to master, response {response:?}");
+        let response = framed
+            .next()
+            .await
+            .context("No response from master for PSYNC")?
+            .context("Failed to decode PSYNC response")?;
 
+        info!("Connected to master, PSYNC response: {:?}", response);
+        Ok(())
+    }
+
+    /// Sends a REPLCONF command with the specified key-value pair
+    ///
+    /// REPLCONF is used during replication handshake to exchange configuration
+    /// information between master and replica.
+    async fn send_replconf(
+        &self,
+        framed: &mut Framed<TcpStream, RespCodec>,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        let replconf = RespDataType::Array(vec![
+            RespDataType::BulkString("REPLCONF".to_string()),
+            RespDataType::BulkString(key.to_string()),
+            RespDataType::BulkString(value.to_string()),
+        ]);
+
+        framed
+            .send(replconf)
+            .await
+            .context("Failed to send REPLCONF command")?;
+
+        let response = framed
+            .next()
+            .await
+            .context("No response from master for REPLCONF")?
+            .context("Failed to decode REPLCONF response")?;
+
+        debug!("Received REPLCONF {} response: {:?}", key, response);
         Ok(())
     }
 
@@ -92,7 +152,7 @@ impl RedisServer {
 
         let info = self.server_info.read().unwrap();
         if let ServerRole::Slave { addr } = &info.role {
-            self.send_handshake(addr).await?
+            self.perform_replication_handshake(addr).await?
         }
 
         loop {
@@ -158,7 +218,7 @@ impl From<ServerConfig> for ServerInfo {
 }
 
 #[derive(Debug)]
-enum ServerRole {
+pub enum ServerRole {
     Master,
     Slave { addr: String },
 }
@@ -196,9 +256,7 @@ impl Connection {
 
             match cmd {
                 Ok(cmd) => {
-                    println!("Recv {cmd:?}");
-                    let response = self.process_command(cmd).await;
-                    self.framed.send(response).await?;
+                    self.process_command(cmd).await?;
                 }
                 Err(e) => {
                     eprintln!("Command error: {}", e);
@@ -213,13 +271,43 @@ impl Connection {
         Ok(())
     }
 
-    /// Processes a single command and returns the appropriate response
-    async fn process_command(&mut self, cmd: Command) -> RespDataType {
-        if self.transaction_queue.is_some() {
+    /// Processes a single command and responds to client
+    async fn process_command(&mut self, cmd: Command) -> Result<()> {
+        let mut resync_flag = false;
+        let response = if self.transaction_queue.is_some() {
             self.handle_transaction_command(cmd).await
         } else {
+            if let Command::PSYNC { .. } = cmd {
+                resync_flag = true;
+            };
             self.handle_regular_command(cmd).await
+        };
+
+        self.framed.send(response).await?;
+
+        if resync_flag {
+            self.send_rdb_file().await?;
         }
+
+        Ok(())
+    }
+
+    /// Sends the RDB file after PSYNC response
+    async fn send_rdb_file(&mut self) -> Result<()> {
+        // Empty RDB file as hex bytes
+        let empty_rdb = include_bytes!("../empty.rdb");
+
+        // Get the underlying TCP stream
+        let stream = self.framed.get_mut();
+
+        // Send RDB file in the format: $<length>\r\n<binary_contents>
+        let rdb_response = format!("${}\r\n", empty_rdb.len());
+        stream.write_all(rdb_response.as_bytes()).await?;
+        stream.write_all(empty_rdb).await?;
+        stream.flush().await?;
+
+        info!("Sent RDB file ({} bytes) to replica", empty_rdb.len());
+        Ok(())
     }
 
     /// Handles commands when in transaction mode
