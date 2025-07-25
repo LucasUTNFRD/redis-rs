@@ -59,7 +59,7 @@ pub struct ServerInfo {
     // The number of connected replicas
     connected_slaves: usize,
     //The replication ID of the master (we'll get to this in later stages)
-    master_replid: usize,
+    master_replid: String,
     // The replication offset of the master (we'll get to this in later stages)
     master_repl_offset: usize,
 }
@@ -78,6 +78,8 @@ impl fmt::Display for ServerInfo {
     }
 }
 
+const DEFAULT_MASTER_ID: &str = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+
 impl From<ServerConfig> for ServerInfo {
     fn from(cfg: ServerConfig) -> Self {
         Self {
@@ -85,7 +87,7 @@ impl From<ServerConfig> for ServerInfo {
                 .replica_of
                 .map_or(ServerRole::Master, |addr| ServerRole::Slave { addr }),
             connected_slaves: 0,
-            master_replid: 0,
+            master_replid: DEFAULT_MASTER_ID.to_string(),
             master_repl_offset: 0,
         }
     }
