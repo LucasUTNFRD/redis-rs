@@ -44,6 +44,21 @@ impl RedisServer {
     }
 }
 
+struct ServerInfo {
+    role: ServerRole,
+    // The number of connected replicas
+    connected_slaves: usize,
+    //The replication ID of the master (we'll get to this in later stages)
+    master_replid: usize,
+    // The replication offset of the master (we'll get to this in later stages)
+    master_repl_offset: usize,
+}
+
+enum ServerRole {
+    Master,
+    Slave,
+}
+
 /// Represents an individual client connection
 pub struct Connection {
     framed: Framed<TcpStream, RespCodec>,
@@ -134,6 +149,7 @@ impl Connection {
             }
             Command::EXEC => RespDataType::SimpleError("ERR EXEC without MULTI".into()),
             Command::DISCARD => RespDataType::SimpleError("ERR DISCARD without MULTI".into()),
+            Command::INFO { section } => RespDataType::BulkString("role:master".into()),
             _ => self.storage.send(cmd).await,
         }
     }

@@ -48,6 +48,14 @@ pub enum Command {
     MULTI,
     EXEC,
     DISCARD,
+    INFO {
+        section: Option<Section>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum Section {
+    Replication,
 }
 
 impl TryFrom<RespDataType> for Command {
@@ -277,6 +285,17 @@ impl TryFrom<RespDataType> for Command {
                         }
                         Ok(Command::DISCARD)
                     }
+
+                    "INFO" => match parts.get(2) {
+                        Some(RespDataType::BulkString(param)) => match param.as_str() {
+                            "replication" => Ok(Command::INFO {
+                                section: Some(Section::Replication),
+                            }),
+                            _ => bail!("ERR unsupported INFO section"),
+                        },
+                        Some(_) => bail!("ERR expected BulkString for section"),
+                        None => Ok(Command::INFO { section: None }),
+                    },
                     _ => bail!("Unknown command: {}", cmd),
                 }
             }
