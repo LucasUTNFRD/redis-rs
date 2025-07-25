@@ -265,7 +265,11 @@ impl Connection {
             Command::PSYNC {
                 replication_id,
                 offset: _,
-            } => RespDataType::SimpleString(format!("FULLRESYNC {replication_id} 0")),
+            } => {
+                let current_offset = 0;
+                let my_id = DEFAULT_MASTER_ID;
+                RespDataType::SimpleString(format!("FULLRESYNC {} {}", my_id, current_offset))
+            }
             _ => self.storage.send(cmd).await,
         }
     }
