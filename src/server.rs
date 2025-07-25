@@ -43,8 +43,29 @@ impl RedisServer {
 
         // TODO : remove .unwrap()
         // assert is pong
-        let ping_response = framed.next().await.unwrap().unwrap();
-        println!("recv:{ping_response:?}");
+        let response = framed.next().await.unwrap().unwrap();
+        // println!("recv:{response:?}");
+
+        let first_replconf = RespDataType::Array(vec![
+            RespDataType::BulkString("REPLCONF".to_string()),
+            RespDataType::BulkString("listening-port".to_string()),
+            RespDataType::BulkString("6380".to_string()),
+        ]);
+
+        framed.send(first_replconf).await?;
+
+        let response = framed.next().await.unwrap().unwrap();
+        // println!("recv:{response:?}");
+
+        let second_replconf = RespDataType::Array(vec![
+            RespDataType::BulkString("REPLCONF".to_string()),
+            RespDataType::BulkString("capa".to_string()),
+            RespDataType::BulkString("psync2".to_string()),
+        ]);
+        framed.send(second_replconf).await?;
+        let response = framed.next().await.unwrap().unwrap();
+        // println!("recv:{response:?}");
+
         Ok(())
     }
 
@@ -229,6 +250,10 @@ impl Connection {
             Command::EXEC => RespDataType::SimpleError("ERR EXEC without MULTI".into()),
             Command::DISCARD => RespDataType::SimpleError("ERR DISCARD without MULTI".into()),
             Command::INFO { section: _ } => self.retrieve_info(),
+            Command::REPLCONF => RespDataType::SimpleString("OK".into()),
+            Command::PSYNC => {
+                todo!()
+            }
             _ => self.storage.send(cmd).await,
         }
     }

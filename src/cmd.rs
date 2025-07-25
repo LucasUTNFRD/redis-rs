@@ -51,6 +51,8 @@ pub enum Command {
     INFO {
         section: Option<Section>,
     },
+    REPLCONF,
+    PSYNC,
 }
 
 #[derive(Debug, Clone)]
@@ -284,6 +286,12 @@ impl TryFrom<RespDataType> for Command {
                             bail!("DISCARD command takes no arguments");
                         }
                         Ok(Command::DISCARD)
+                    }
+                    "REPLCONF" => {
+                        if let Some(args) = parts.get(1..) {
+                            println!("{args:?}");
+                        }
+                        Ok(Command::REPLCONF)
                     }
 
                     "INFO" => match parts.get(2) {
