@@ -3,6 +3,7 @@ use crate::resp::{RespCodec, RespDataType};
 use crate::{cmd::Command, storage::StorageHandle};
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
+use log::{debug, info, warn};
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, RwLock};
@@ -33,57 +34,102 @@ impl RedisServer {
         })
     }
 
-    async fn send_handshake(&self, addr: &str) -> Result<()> {
-        let stream = TcpStream::connect(addr).await?;
+    /// Performs the complete replication handshake with a Redis master
+    /// 
+    /// This implements the Redis replication protocol handshake sequence:
+    /// 1. PING - Test connectivity
+    /// 2. REPLCONF listening-port <port> - Inform master of our listening port
+    /// 3. REPLCONF capa psync2 - Announce PSYNC2 capability  
+    /// 4. PSYNC ? -1 - Request full synchronization
+    async fn perform_replication_handshake(&self, addr: &str) -> Result<()> {
+        let stream = TcpStream::connect(addr).await
+            .context("Failed to connect to master")?;
         let mut framed = Framed::new(stream, RespCodec);
 
-        // #1 send ping command
+        info!("Starting replication handshake with master at {}", addr);
+
+        // Step 1: Send PING to test connectivity
         let ping = RespDataType::Array(vec![RespDataType::BulkString("PING".into())]);
-        framed.send(ping).await?;
+        framed.send(ping).await
+            .context("Failed to send PING to master")?;
 
-        // TODO : remove .unwrap()
-        // assert is pong
-        let response = framed.next().await.unwrap().unwrap();
-        // println!("recv:{response:?}");
+        let response = framed.next().await
+            .context("No response from master for PING")?
+            .context("Failed to decode PING response")?;
+        debug!("Received PING response: {:?}", response);
 
-        let first_replconf = RespDataType::Array(vec![
+        // Step 2: Send REPLCONF commands
+        self.send_replconf(&mut framed, "listening-port", "6380").await
+            .context("Failed to send listening-port REPLCONF")?;
+            
+        self.send_replconf(&mut framed, "capa", "psync2").await
+            .context("Failed to send capa REPLCONF")?;
+
+        // Step 3: Send PSYNC for full synchronization
+        self.send_psync(&mut framed).await
+            .context("Failed to send PSYNC")?;
+
+        info!("Replication handshake completed successfully");
+        Ok(())
+    }
+
+    /// Sends a REPLCONF command with the specified key-value pair
+    /// 
+    /// REPLCONF is used during replication handshake to exchange configuration
+    /// information between master and replica.
+    async fn send_replconf(
+        &self, 
+        framed: &mut Framed<TcpStream, RespCodec>, 
+        key: &str, 
+        value: &str
+    ) -> Result<()> {
+        let replconf = RespDataType::Array(vec![
             RespDataType::BulkString("REPLCONF".to_string()),
-            RespDataType::BulkString("listening-port".to_string()),
-            RespDataType::BulkString("6380".to_string()),
+            RespDataType::BulkString(key.to_string()),
+            RespDataType::BulkString(value.to_string()),
         ]);
 
-        framed.send(first_replconf).await?;
+        framed.send(replconf).await
+            .context("Failed to send REPLCONF command")?;
 
-        let response = framed.next().await.unwrap().unwrap();
-        // println!("recv:{response:?}");
+        let response = framed.next().await
+            .context("No response from master for REPLCONF")?
+            .context("Failed to decode REPLCONF response")?;
+            
+        debug!("Received REPLCONF {} response: {:?}", key, response);
+        Ok(())
+    }
 
-        let second_replconf = RespDataType::Array(vec![
-            RespDataType::BulkString("REPLCONF".to_string()),
-            RespDataType::BulkString("capa".to_string()),
-            RespDataType::BulkString("psync2".to_string()),
-        ]);
-        framed.send(second_replconf).await?;
-        let response = framed.next().await.unwrap().unwrap();
-        // println!("recv:{response:?}");
-        //
+    /// Sends a PSYNC command to request synchronization with the master
+    /// 
+    /// PSYNC ? -1 requests a full synchronization since we don't have any
+    /// previous replication state (? for unknown replication ID, -1 for unknown offset).
+    async fn send_psync(&self, framed: &mut Framed<TcpStream, RespCodec>) -> Result<()> {
         let psync = RespDataType::Array(vec![
             RespDataType::BulkString("PSYNC".to_string()),
             RespDataType::BulkString("?".to_string()),
             RespDataType::BulkString("-1".to_string()),
         ]);
 
-        framed.send(psync).await?;
+        framed.send(psync).await
+            .context("Failed to send PSYNC command")?;
 
-        let response = framed.next().await.unwrap().unwrap();
-        println!("Connected to master, response {response:?}");
-
+        let response = framed.next().await
+            .context("No response from master for PSYNC")?
+            .context("Failed to decode PSYNC response")?;
+            
+        info!("Connected to master, PSYNC response: {:?}", response);
         Ok(())
+    }
+
+    async fn send_handshake(&self, addr: &str) -> Result<()> {
+        self.perform_replication_handshake(addr).await
     }
 
     /// Starts the server and begins accepting connections
     pub async fn run(self) -> Result<()> {
         {
-            println!(
+            info!(
                 "Redis server started on {} with role {:#?}",
                 self.listener.local_addr()?,
                 self.server_info.read().unwrap().role
@@ -97,7 +143,7 @@ impl RedisServer {
 
         loop {
             let (socket, peer_addr) = self.listener.accept().await?;
-            println!("Accepted new connection from: {}", peer_addr);
+            info!("Accepted new connection from: {}", peer_addr);
 
             let storage = self.storage.clone();
             // server_info could not be shared and be asked via cmd
@@ -106,7 +152,7 @@ impl RedisServer {
             tokio::spawn(async move {
                 let mut connection = Connection::new(socket, storage, server_info);
                 if let Err(e) = connection.handle().await {
-                    eprintln!("Error handling connection from {}: {:?}", peer_addr, e);
+                    warn!("Error handling connection from {}: {:?}", peer_addr, e);
                 }
             });
         }
@@ -158,7 +204,7 @@ impl From<ServerConfig> for ServerInfo {
 }
 
 #[derive(Debug)]
-enum ServerRole {
+pub enum ServerRole {
     Master,
     Slave { addr: String },
 }
@@ -196,12 +242,12 @@ impl Connection {
 
             match cmd {
                 Ok(cmd) => {
-                    println!("Recv {cmd:?}");
+                    debug!("Recv {cmd:?}");
                     let response = self.process_command(cmd).await;
                     self.framed.send(response).await?;
                 }
                 Err(e) => {
-                    eprintln!("Command error: {}", e);
+                    warn!("Command error: {}", e);
                     let _ = self
                         .framed
                         .send(RespDataType::SimpleError(e.to_string()))
