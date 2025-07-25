@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 
 use crate::resp::RespDataType;
 
@@ -311,17 +311,19 @@ impl TryFrom<RespDataType> for Command {
                         if parts.len() != 3 {
                             bail!("expected 3 parameters in psync");
                         }
+
                         match (&parts[1], &parts[2]) {
                             (
                                 RespDataType::BulkString(replica_id),
                                 RespDataType::BulkString(master_offset),
-                            ) => Ok(Command::PSYNC {
-                                replication_id: replica_id.clone(),
-                                offset: master_offset
-                                    .parse()
-                                    .expect("Failed to take offset as i64"),
-                            }),
-                            _ => bail!("lazy to handle this"),
+                            ) => {
+                                let offset = master_offset.parse::<i64>().map_err(|e| anyhow!("Failed to parse offset as i64: {}", e))?;
+                                Ok(Command::PSYNC {
+                                    replication_id: replica_id.clone(),
+                                    offset,
+                                })
+                            }
+                            _ => bail!("PSYNC expects two BulkString parameters: replication_id and offset"),
                         }
                     }
                     _ => bail!("Unknown command: {}", cmd),
