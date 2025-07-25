@@ -1,8 +1,11 @@
+use crate::config::ServerConfig;
 use crate::resp::{RespCodec, RespDataType};
 use crate::{cmd::Command, storage::StorageHandle};
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use std::collections::VecDeque;
+use std::fmt;
+use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
@@ -10,18 +13,24 @@ use tokio_util::codec::Framed;
 pub struct RedisServer {
     listener: TcpListener,
     storage: StorageHandle,
+    server_info: Arc<Mutex<ServerInfo>>,
 }
 
 impl RedisServer {
     /// Creates a new Redis server bound to the specified address
-    pub async fn new(addr: &str) -> Result<Self> {
-        let listener = TcpListener::bind(addr)
+    pub async fn new(config: ServerConfig) -> Result<Self> {
+        let listener = TcpListener::bind(&config.bind_addr)
             .await
             .context("Failed to bind to address")?;
 
         let storage = StorageHandle::new();
+        let server_info = Arc::new(Mutex::new(ServerInfo::from(config)));
 
-        Ok(Self { listener, storage })
+        Ok(Self {
+            listener,
+            storage,
+            server_info,
+        })
     }
 
     /// Starts the server and begins accepting connections
@@ -33,9 +42,10 @@ impl RedisServer {
             println!("Accepted new connection from: {}", peer_addr);
 
             let storage = self.storage.clone();
+            let server_info = self.server_info.clone();
 
             tokio::spawn(async move {
-                let mut connection = Connection::new(socket, storage);
+                let mut connection = Connection::new(socket, storage, server_info);
                 if let Err(e) = connection.handle().await {
                     eprintln!("Error handling connection from {}: {:?}", peer_addr, e);
                 }
@@ -44,7 +54,7 @@ impl RedisServer {
     }
 }
 
-struct ServerInfo {
+pub struct ServerInfo {
     role: ServerRole,
     // The number of connected replicas
     connected_slaves: usize,
@@ -54,9 +64,36 @@ struct ServerInfo {
     master_repl_offset: usize,
 }
 
+impl fmt::Display for ServerInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.role {
+            ServerRole::Master => write!(f, "role:master")?,
+            ServerRole::Slave { .. } => write!(f, "role:slave")?,
+        }
+        // Add other replication info fields
+        writeln!(f, "connected_slaves:{}", self.connected_slaves)?;
+        writeln!(f, "master_replid:{}", self.master_replid)?;
+        writeln!(f, "master_repl_offset:{}", self.master_repl_offset)?;
+        Ok(())
+    }
+}
+
+impl From<ServerConfig> for ServerInfo {
+    fn from(cfg: ServerConfig) -> Self {
+        Self {
+            role: cfg
+                .replica_of
+                .map_or(ServerRole::Master, |addr| ServerRole::Slave { addr }),
+            connected_slaves: 0,
+            master_replid: 0,
+            master_repl_offset: 0,
+        }
+    }
+}
+
 enum ServerRole {
     Master,
-    Slave,
+    Slave { addr: String },
 }
 
 /// Represents an individual client connection
@@ -64,17 +101,23 @@ pub struct Connection {
     framed: Framed<TcpStream, RespCodec>,
     storage: StorageHandle,
     transaction_queue: Option<VecDeque<Command>>,
+    server_info: Arc<Mutex<ServerInfo>>,
 }
 
 impl Connection {
     /// Creates a new connection with the given socket and storage handle
-    pub fn new(socket: TcpStream, storage: StorageHandle) -> Self {
+    pub fn new(
+        socket: TcpStream,
+        storage: StorageHandle,
+        server_info: Arc<Mutex<ServerInfo>>,
+    ) -> Self {
         let framed = Framed::new(socket, RespCodec);
 
         Self {
             framed,
             storage,
             transaction_queue: None,
+            server_info,
         }
     }
 
@@ -149,9 +192,26 @@ impl Connection {
             }
             Command::EXEC => RespDataType::SimpleError("ERR EXEC without MULTI".into()),
             Command::DISCARD => RespDataType::SimpleError("ERR DISCARD without MULTI".into()),
-            Command::INFO { section } => RespDataType::BulkString("role:master".into()),
+            Command::INFO { section: _ } => self.retrieve_info(),
             _ => self.storage.send(cmd).await,
         }
+    }
+
+    /// retrieves a BulkString like
+    /// $ redis-cli INFO replication
+    /// # Replication
+    /// role:master
+    /// connected_slaves:0
+    /// master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb
+    /// master_repl_offset:0
+    /// second_repl_offset:-1
+    /// repl_backlog_active:0
+    /// repl_backlog_size:1048576
+    /// repl_backlog_first_byte_offset:0
+    /// repl_backlog_histlen:
+    fn retrieve_info(&self) -> RespDataType {
+        let server_info = self.server_info.lock().unwrap();
+        RespDataType::BulkString(server_info.to_string())
     }
 
     /// Executes a transaction by processing all queued commands
