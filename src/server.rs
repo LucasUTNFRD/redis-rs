@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
@@ -13,7 +13,7 @@ use tokio_util::codec::Framed;
 pub struct RedisServer {
     listener: TcpListener,
     storage: StorageHandle,
-    server_info: Arc<Mutex<ServerInfo>>,
+    server_info: Arc<RwLock<ServerInfo>>,
 }
 
 impl RedisServer {
@@ -24,7 +24,7 @@ impl RedisServer {
             .context("Failed to bind to address")?;
 
         let storage = StorageHandle::new();
-        let server_info = Arc::new(Mutex::new(ServerInfo::from(config)));
+        let server_info = Arc::new(RwLock::new(ServerInfo::from(config)));
 
         Ok(Self {
             listener,
@@ -33,15 +33,42 @@ impl RedisServer {
         })
     }
 
+    async fn send_handshake(&self, addr: &str) -> Result<()> {
+        let stream = TcpStream::connect(addr).await?;
+        let mut framed = Framed::new(stream, RespCodec);
+
+        // #1 send ping command
+        let ping = RespDataType::Array(vec![RespDataType::BulkString("PING".into())]);
+        framed.send(ping).await?;
+
+        // TODO : remove .unwrap()
+        // assert is pong
+        let ping_response = framed.next().await.unwrap().unwrap();
+        println!("recv:{ping_response:?}");
+        Ok(())
+    }
+
     /// Starts the server and begins accepting connections
     pub async fn run(self) -> Result<()> {
-        println!("Redis server started on {}", self.listener.local_addr()?);
+        {
+            println!(
+                "Redis server started on {} with role {:#?}",
+                self.listener.local_addr()?,
+                self.server_info.read().unwrap().role
+            );
+        }
+
+        let info = self.server_info.read().unwrap();
+        if let ServerRole::Slave { addr } = &info.role {
+            self.send_handshake(addr).await?
+        }
 
         loop {
             let (socket, peer_addr) = self.listener.accept().await?;
             println!("Accepted new connection from: {}", peer_addr);
 
             let storage = self.storage.clone();
+            // server_info could not be shared and be asked via cmd
             let server_info = self.server_info.clone();
 
             tokio::spawn(async move {
@@ -55,13 +82,18 @@ impl RedisServer {
 }
 
 pub struct ServerInfo {
-    role: ServerRole,
+    pub role: ServerRole,
     // The number of connected replicas
-    connected_slaves: usize,
+    pub connected_slaves: usize,
     //The replication ID of the master (we'll get to this in later stages)
-    master_replid: String,
+    pub master_replid: String,
     // The replication offset of the master (we'll get to this in later stages)
-    master_repl_offset: usize,
+    pub master_repl_offset: usize,
+}
+impl ServerInfo {
+    pub fn is_slave(&self) -> bool {
+        matches!(self.role, ServerRole::Slave { addr: _ })
+    }
 }
 
 impl fmt::Display for ServerInfo {
@@ -93,6 +125,7 @@ impl From<ServerConfig> for ServerInfo {
     }
 }
 
+#[derive(Debug)]
 enum ServerRole {
     Master,
     Slave { addr: String },
@@ -103,7 +136,7 @@ pub struct Connection {
     framed: Framed<TcpStream, RespCodec>,
     storage: StorageHandle,
     transaction_queue: Option<VecDeque<Command>>,
-    server_info: Arc<Mutex<ServerInfo>>,
+    server_info: Arc<RwLock<ServerInfo>>,
 }
 
 impl Connection {
@@ -111,7 +144,7 @@ impl Connection {
     pub fn new(
         socket: TcpStream,
         storage: StorageHandle,
-        server_info: Arc<Mutex<ServerInfo>>,
+        server_info: Arc<RwLock<ServerInfo>>,
     ) -> Self {
         let framed = Framed::new(socket, RespCodec);
 
@@ -131,6 +164,7 @@ impl Connection {
 
             match cmd {
                 Ok(cmd) => {
+                    println!("Recv {cmd:?}");
                     let response = self.process_command(cmd).await;
                     self.framed.send(response).await?;
                 }
@@ -212,7 +246,7 @@ impl Connection {
     /// repl_backlog_first_byte_offset:0
     /// repl_backlog_histlen:
     fn retrieve_info(&self) -> RespDataType {
-        let server_info = self.server_info.lock().unwrap();
+        let server_info = self.server_info.read().unwrap();
         RespDataType::BulkString(server_info.to_string())
     }
 
