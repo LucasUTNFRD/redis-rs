@@ -52,7 +52,10 @@ pub enum Command {
         section: Option<Section>,
     },
     REPLCONF,
-    PSYNC,
+    PSYNC {
+        replication_id: String,
+        offset: i64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +307,23 @@ impl TryFrom<RespDataType> for Command {
                         Some(_) => bail!("ERR expected BulkString for section"),
                         None => Ok(Command::INFO { section: None }),
                     },
+                    "PSYNC" => {
+                        if parts.len() != 3 {
+                            bail!("expected 3 parameters in psync");
+                        }
+                        match (&parts[1], &parts[2]) {
+                            (
+                                RespDataType::BulkString(replica_id),
+                                RespDataType::BulkString(master_offset),
+                            ) => Ok(Command::PSYNC {
+                                replication_id: replica_id.clone(),
+                                offset: master_offset
+                                    .parse()
+                                    .expect("Failed to take offset as i64"),
+                            }),
+                            _ => bail!("lazy to handle this"),
+                        }
+                    }
                     _ => bail!("Unknown command: {}", cmd),
                 }
             }

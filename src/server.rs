@@ -65,6 +65,17 @@ impl RedisServer {
         framed.send(second_replconf).await?;
         let response = framed.next().await.unwrap().unwrap();
         // println!("recv:{response:?}");
+        //
+        let psync = RespDataType::Array(vec![
+            RespDataType::BulkString("PSYNC".to_string()),
+            RespDataType::BulkString("?".to_string()),
+            RespDataType::BulkString("-1".to_string()),
+        ]);
+
+        framed.send(psync).await?;
+
+        let response = framed.next().await.unwrap().unwrap();
+        println!("Connected to master, response {response:?}");
 
         Ok(())
     }
@@ -251,9 +262,10 @@ impl Connection {
             Command::DISCARD => RespDataType::SimpleError("ERR DISCARD without MULTI".into()),
             Command::INFO { section: _ } => self.retrieve_info(),
             Command::REPLCONF => RespDataType::SimpleString("OK".into()),
-            Command::PSYNC => {
-                todo!()
-            }
+            Command::PSYNC {
+                replication_id,
+                offset: _,
+            } => RespDataType::SimpleString(format!("FULLRESYNC {replication_id} 0")),
             _ => self.storage.send(cmd).await,
         }
     }
