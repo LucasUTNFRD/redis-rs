@@ -1,21 +1,168 @@
-use crate::config::ServerConfig;
-use crate::resp::{RespCodec, RespDataType};
-use crate::{cmd::Command, storage::StorageHandle};
-use anyhow::{Context, Result};
-use futures::{SinkExt, StreamExt};
-use std::collections::VecDeque;
-use std::fmt;
-use std::sync::{Arc, RwLock};
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
-use tokio_util::codec::Framed;
-use tracing::{debug, info};
+use std::{
+    collections::HashMap,
+    fmt,
+    net::SocketAddr,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
-/// Represents a Redis server that handles client connections
+use anyhow::{bail, Context, Result};
+use futures::{SinkExt, StreamExt};
+use tokio::{
+    io::AsyncWriteExt,
+    net::{TcpListener, TcpStream},
+    sync::{mpsc, oneshot},
+};
+use tokio_util::codec::Framed;
+
+use crate::{
+    cmd::Command,
+    config::ServerConfig,
+    resp::{RespCodec, RespDataType},
+    storage::StorageHandle,
+};
+
 pub struct RedisServer {
     listener: TcpListener,
     storage: StorageHandle,
-    server_info: Arc<RwLock<ServerInfo>>,
+    info: ServerInfo,
+    role_state: RoleState,
+
+    cmd_tx: mpsc::Sender<ServerCommand>,
+    cmd_rx: mpsc::Receiver<ServerCommand>,
+}
+
+// Role-specific"idk"e
+enum RoleState {
+    Master(MasterState),
+    Replica(ReplicaState),
+}
+
+// Master-specific fields
+struct MasterState {
+    pub master_replid: String,
+    pub master_repl_offset: u64,
+    pub replica_connections: HashMap<u64, ReplicaConnection>,
+}
+
+// Supporting types
+struct ReplicaConnection {
+    sender: mpsc::UnboundedSender<ReplicaCommand>,
+    // last_ack_offset: u64,
+}
+
+impl ReplicaConnection {}
+
+impl Default for MasterState {
+    fn default() -> Self {
+        Self {
+            master_replid: DEFAULT_MASTER_ID.to_string(),
+            master_repl_offset: 0,
+            replica_connections: HashMap::new(),
+        }
+    }
+}
+
+// Replica-specific fields
+#[derive(Default)]
+struct ReplicaState {
+    master_connection: Option<Framed<TcpStream, RespCodec>>,
+}
+
+pub struct ServerInfo {
+    pub role: ServerRole,
+    // The number of connected replicas
+    pub connected_slaves: usize,
+    //The replication ID of the master (we'll get to this in later stages)
+    pub master_replid: String,
+    // The replication offset of the master (we'll get to this in later stages)
+    pub master_repl_offset: usize,
+}
+
+impl fmt::Display for ServerInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.role {
+            ServerRole::Master => write!(f, "role:master")?,
+            ServerRole::Slave { .. } => write!(f, "role:slave")?,
+        }
+        // Add other replication info fields
+        writeln!(f, "connected_slaves:{}", self.connected_slaves)?;
+        writeln!(f, "master_replid:{}", self.master_replid)?;
+        writeln!(f, "master_repl_offset:{}", self.master_repl_offset)?;
+        Ok(())
+    }
+}
+
+const DEFAULT_MASTER_ID: &str = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+
+impl From<ServerConfig> for ServerInfo {
+    fn from(cfg: ServerConfig) -> Self {
+        Self {
+            role: cfg
+                .replica_of
+                .map_or(ServerRole::Master, |master_addr| ServerRole::Slave {
+                    master_addr,
+                }),
+            connected_slaves: 0,
+            master_replid: DEFAULT_MASTER_ID.to_string(),
+            master_repl_offset: 0,
+        }
+    }
+}
+
+impl ServerInfo {
+    pub fn get_role(&self) -> ServerRole {
+        self.role.clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ServerRole {
+    Master,
+    Slave { master_addr: String },
+}
+
+#[derive(Debug)]
+pub enum ServerCommand {
+    Storage {
+        cmd: Command,
+        resp: oneshot::Sender<RespDataType>,
+    },
+    Replication {
+        cmd: Command,
+        replica_id: u64,
+        resp: oneshot::Sender<RespDataType>,
+    },
+    RegisterReplica {
+        id: u64,
+        sender: mpsc::UnboundedSender<ReplicaCommand>,
+    },
+    Misc {
+        cmd: Command,
+        resp: oneshot::Sender<RespDataType>,
+    },
+    Transaction {
+        queued_cmds: Vec<Command>,
+        resp: oneshot::Sender<RespDataType>,
+    },
+}
+
+impl ServerCommand {
+    pub fn is_write(&self) -> bool {
+        if let Self::Storage { cmd, resp: _ } = self {
+            let cond = match cmd {
+                // Write operations that modify data
+                Command::SET { .. } => true,
+                Command::RPUSH { .. } => true,
+                Command::LPUSH { .. } => true,
+                Command::LPOP { .. } => true,
+                Command::BLPOP { .. } => true,
+                Command::INCR { .. } => true,
+                _ => false,
+            };
+            return cond;
+        };
+        false
+    }
 }
 
 impl RedisServer {
@@ -26,13 +173,28 @@ impl RedisServer {
             .context("Failed to bind to address")?;
 
         let storage = StorageHandle::new();
-        let server_info = Arc::new(RwLock::new(ServerInfo::from(config)));
+
+        let info = ServerInfo::from(config);
+
+        let role_state = match info.get_role() {
+            ServerRole::Slave { master_addr: _ } => RoleState::Replica(ReplicaState::default()),
+            ServerRole::Master => RoleState::Master(MasterState::default()),
+        };
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(1024);
 
         Ok(Self {
             listener,
             storage,
-            server_info,
+            info,
+            role_state,
+            cmd_tx,
+            cmd_rx,
         })
+    }
+
+    fn is_master(&self) -> bool {
+        matches!(self.role_state, RoleState::Master(_))
     }
 
     /// Performs the complete replication handshake with a Redis master
@@ -42,13 +204,11 @@ impl RedisServer {
     /// 2. REPLCONF listening-port <port> - Inform master of our listening port
     /// 3. REPLCONF capa psync2 - Announce PSYNC2 capability
     /// 4. PSYNC ? -1 - Request full synchronization
-    async fn perform_replication_handshake(&self, addr: &str) -> Result<()> {
+    async fn handshake_master(&self, addr: &str) -> Result<Framed<TcpStream, RespCodec>> {
         let stream = TcpStream::connect(addr)
             .await
             .context("Failed to connect to master")?;
         let mut framed = Framed::new(stream, RespCodec);
-
-        info!("Starting replication handshake with master at {}", addr);
 
         // Step 1: Send PING to test connectivity
         let ping = RespDataType::Array(vec![RespDataType::BulkString("PING".into())]);
@@ -58,12 +218,11 @@ impl RedisServer {
             .await
             .context("Failed to send PING to master")?;
 
-        let response = framed
+        let _response = framed
             .next()
             .await
             .context("No response from master for PING")?
             .context("Failed to decode PING response")?;
-        debug!("Received PING response: {:?}", response);
 
         // Step 2: Send REPLCONF commands
         self.send_replconf(&mut framed, "listening-port", "6380")
@@ -79,8 +238,7 @@ impl RedisServer {
             .await
             .context("Failed to send PSYNC")?;
 
-        info!("Replication handshake completed successfully");
-        Ok(())
+        Ok(framed)
     }
 
     /// Sends a PSYNC command to request synchronization with the master
@@ -99,13 +257,12 @@ impl RedisServer {
             .await
             .context("Failed to send PSYNC command")?;
 
-        let response = framed
+        let _response = framed
             .next()
             .await
             .context("No response from master for PSYNC")?
             .context("Failed to decode PSYNC response")?;
 
-        info!("Connected to master, PSYNC response: {:?}", response);
         Ok(())
     }
 
@@ -130,140 +287,296 @@ impl RedisServer {
             .await
             .context("Failed to send REPLCONF command")?;
 
-        let response = framed
+        let _response = framed
             .next()
             .await
-            .context("No response from master for REPLCONF")?
+            .context("No response from master forREPLCONF")?
             .context("Failed to decode REPLCONF response")?;
 
-        debug!("Received REPLCONF {} response: {:?}", key, response);
         Ok(())
     }
 
-    /// Starts the server and begins accepting connections
-    pub async fn run(self) -> Result<()> {
-        {
-            println!(
-                "Redis server started on {} with role {:#?}",
-                self.listener.local_addr()?,
-                self.server_info.read().unwrap().role
-            );
+    fn register_master(&mut self, master_connection: Framed<TcpStream, RespCodec>) {
+        if let RoleState::Replica(ref mut state) = self.role_state {
+            state.master_connection = Some(master_connection);
         }
+    }
 
-        let info = self.server_info.read().unwrap();
-        if let ServerRole::Slave { addr } = &info.role {
-            self.perform_replication_handshake(addr).await?
+    pub async fn run_event_loop(mut self) -> Result<()> {
+        if let ServerRole::Slave { master_addr } = &self.info.role {
+            let connection = self.handshake_master(master_addr).await?;
+            self.register_master(connection);
+            // logic for initializing a heartbeat sender
         }
 
         loop {
-            let (socket, peer_addr) = self.listener.accept().await?;
-            println!("Accepted new connection from: {}", peer_addr);
-
-            let storage = self.storage.clone();
-            // server_info could not be shared and be asked via cmd
-            let server_info = self.server_info.clone();
-
-            tokio::spawn(async move {
-                let mut connection = Connection::new(socket, storage, server_info);
-                if let Err(e) = connection.handle().await {
-                    eprintln!("Error handling connection from {}: {:?}", peer_addr, e);
+            tokio::select! {
+                Ok((socket,remote_addr)) = self.listener.accept() => {
+                    let cmd_tx= self.cmd_tx.clone();
+                    tokio::spawn(async move {
+                        let mut connection = Connection::new(socket,remote_addr,cmd_tx);
+                        if let Err(e) = connection.handle().await {
+                            eprintln!("Error handling connection from {}: {:?}", remote_addr, e);
+                        }
+                    });
                 }
-            });
+                cmd = self.cmd_rx.recv() => {
+                    match cmd {
+                        Some(cmd) => {
+                            println!("should handle cmd {cmd:?}");
+                            if let Err(e) = self.handle_command(cmd).await{
+                                eprintln!("Command error: {:?}",e);
+                            }
+                        }
+                        None => {
+                            return Ok(())
+                        }
+                    }
+                }
+
+
+            }
         }
     }
-}
 
-pub struct ServerInfo {
-    pub role: ServerRole,
-    // The number of connected replicas
-    pub connected_slaves: usize,
-    //The replication ID of the master (we'll get to this in later stages)
-    pub master_replid: String,
-    // The replication offset of the master (we'll get to this in later stages)
-    pub master_repl_offset: usize,
-}
-impl ServerInfo {
-    pub fn is_slave(&self) -> bool {
-        matches!(self.role, ServerRole::Slave { addr: _ })
-    }
-}
+    /// Upon receiving PSYNC ? -1, the Redis master initiates a full resynchronization.
+    /// The master records no state for the replica beyond its connection.
+    /// The master generates and sends a full RDB file snapshot of its dataset to the replica
+    fn initiate_full_resync(&mut self, replica_id: u64, resp: oneshot::Sender<RespDataType>) {
+        if let RoleState::Master(ref state) = self.role_state {
+            let cmd_result = RespDataType::SimpleString(format!(
+                "FULLRESYNC {} {}",
+                state.master_replid, state.master_repl_offset
+            ));
 
-impl fmt::Display for ServerInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.role {
-            ServerRole::Master => write!(f, "role:master")?,
-            ServerRole::Slave { .. } => write!(f, "role:slave")?,
+            let _ = resp.send(cmd_result);
+
+            state
+                .replica_connections
+                .get(&replica_id)
+                .map(|replica| replica.sender.send(ReplicaCommand::SendRdb));
         }
-        // Add other replication info fields
-        writeln!(f, "connected_slaves:{}", self.connected_slaves)?;
-        writeln!(f, "master_replid:{}", self.master_replid)?;
-        writeln!(f, "master_repl_offset:{}", self.master_repl_offset)?;
+    }
+
+    async fn handle_command(&mut self, cmd: ServerCommand) -> Result<()> {
+        match cmd {
+            ServerCommand::Transaction { queued_cmds, resp } => {
+                // Execute all commands atomically
+                let mut results = Vec::with_capacity(queued_cmds.len());
+
+                // Process each command in the transaction
+                for cmd in queued_cmds {
+                    match cmd {
+                        // Storage commands
+                        Command::GET { .. }
+                        | Command::SET { .. }
+                        | Command::RPUSH { .. }
+                        | Command::LRANGE { .. }
+                        | Command::LPUSH { .. }
+                        | Command::LLEN { .. }
+                        | Command::LPOP { .. }
+                        | Command::INCR { .. }
+                        | Command::BLPOP { .. } => {
+                            let result = self.storage.send(cmd).await;
+                            results.push(result);
+                        }
+
+                        // Simple commands
+                        Command::PING => {
+                            results.push(RespDataType::SimpleString("PONG".to_string()));
+                        }
+                        Command::ECHO(msg) => {
+                            results.push(RespDataType::BulkString(msg));
+                        }
+                        Command::INFO { section: _ } => {
+                            results.push(RespDataType::BulkString(self.info.to_string()));
+                        }
+
+                        // Transaction commands shouldn't be in the queue
+                        Command::MULTI | Command::EXEC | Command::DISCARD => {
+                            results.push(RespDataType::SimpleError(
+                                "ERR transaction control commands cannot be nested".into(),
+                            ));
+                        }
+
+                        // Commands not supported in transactions
+                        Command::REPLCONF { .. } | Command::PSYNC { .. } => {
+                            results.push(RespDataType::SimpleError(
+                                "ERR replication commands not allowed in transaction".into(),
+                            ));
+                        }
+                    }
+                }
+
+                // Send all results as a single array
+                let _ = resp.send(RespDataType::Array(results));
+            }
+            // Other command handling remains unchanged
+            ServerCommand::Storage { cmd, resp } => {
+                if let RoleState::Master(ref state) = self.role_state {
+                    state.replica_connections.values().for_each(|replica| {
+                        let _ = replica
+                            .sender
+                            .send(ReplicaCommand::CommandProgation(cmd.clone()));
+                    });
+                }
+
+                let cmd_result = self.storage.send(cmd).await;
+                let _ = resp.send(cmd_result);
+            }
+            ServerCommand::Replication {
+                cmd,
+                replica_id,
+                resp,
+            } => match cmd {
+                Command::PSYNC {
+                    replication_id,
+                    offset,
+                } => {
+                    let full_resync_needed = replication_id == "?" && offset == -1;
+                    if self.is_master() && full_resync_needed {
+                        self.initiate_full_resync(replica_id, resp);
+                    }
+                }
+                Command::REPLCONF => {
+                    let cmd_result = RespDataType::SimpleString("OK".into());
+                    let _ = resp.send(cmd_result);
+                }
+                // Command::PING => {
+                //     let cmd_result = RespDataType::SimpleString("PONG".to_string());
+                //     let _ = resp.send(cmd_result);
+                // }
+                cmd => bail!("Command:{cmd:?} was not replication related"),
+            },
+            ServerCommand::RegisterReplica { id, sender } => {
+                if let RoleState::Master(ref mut state) = self.role_state {
+                    state.replica_connections.insert(
+                        id,
+                        ReplicaConnection {
+                            sender: sender.clone(),
+                        },
+                    );
+                } else {
+                    panic!("A replica tried to modify Master state");
+                };
+            }
+            ServerCommand::Misc { cmd, resp } => {
+                let cmd_result = match cmd {
+                    // Simple commands
+                    Command::PING => RespDataType::SimpleString("PONG".to_string()),
+                    Command::ECHO(msg) => RespDataType::BulkString(msg),
+                    Command::INFO { section: _ } => RespDataType::BulkString(self.info.to_string()),
+                    _ => panic!("Non misc cmd"),
+                };
+                let _ = resp.send(cmd_result);
+            }
+        }
         Ok(())
     }
 }
 
-const DEFAULT_MASTER_ID: &str = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
-impl From<ServerConfig> for ServerInfo {
-    fn from(cfg: ServerConfig) -> Self {
-        Self {
-            role: cfg
-                .replica_of
-                .map_or(ServerRole::Master, |addr| ServerRole::Slave { addr }),
-            connected_slaves: 0,
-            master_replid: DEFAULT_MASTER_ID.to_string(),
-            master_repl_offset: 0,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum ServerRole {
-    Master,
-    Slave { addr: String },
-}
-
-/// Represents an individual client connection
+/// Connections handle I/O only
 pub struct Connection {
     framed: Framed<TcpStream, RespCodec>,
-    storage: StorageHandle,
-    transaction_queue: Option<VecDeque<Command>>,
-    server_info: Arc<RwLock<ServerInfo>>,
+    remote_addr: SocketAddr,
+    server_cmd_tx: mpsc::Sender<ServerCommand>,
+
+    //Replica connection state
+    replica_rx: Option<mpsc::UnboundedReceiver<ReplicaCommand>>,
+    replica_id: Option<u64>,
+
+    execution_mode: ExecutionMode,
+}
+
+pub enum ExecutionMode {
+    Transaction { cmd_queue: Vec<Command> },
+    Normal,
+}
+
+pub enum ReplicaCommand {
+    SendRdb,
+    CommandProgation(Command),
 }
 
 impl Connection {
-    /// Creates a new connection with the given socket and storage handle
     pub fn new(
         socket: TcpStream,
-        storage: StorageHandle,
-        server_info: Arc<RwLock<ServerInfo>>,
+        remote_addr: SocketAddr,
+        server_cmd_tx: mpsc::Sender<ServerCommand>,
     ) -> Self {
         let framed = Framed::new(socket, RespCodec);
-
         Self {
             framed,
-            storage,
-            transaction_queue: None,
-            server_info,
+            remote_addr,
+            server_cmd_tx,
+            replica_rx: None,
+            replica_id: None,
+            execution_mode: ExecutionMode::Normal,
         }
     }
 
-    /// Handles the connection lifecycle, processing commands until the connection closes
     pub async fn handle(&mut self) -> Result<()> {
-        while let Some(resp_result) = self.framed.next().await {
-            let resp_data = resp_result.context("Decoding failed")?;
-            let cmd = Command::try_from(resp_data);
+        loop {
+            tokio::select! {
+                // Handle incoming frames from the client/replica
+                resp_result = self.framed.next() => {
+                    match resp_result {
+                        Some(Ok(resp_data)) => {
+                            let cmd = Command::try_from(resp_data);
 
-            match cmd {
-                Ok(cmd) => {
-                    self.process_command(cmd).await?;
+                            match cmd {
+                                Ok(cmd) => {
+                                if let Err(e) = self.handle_cmd(cmd).await {
+                                    eprintln!("Failed to send command to server: {}", e);
+                                    break;
+                                }
+                            }
+                                Err(e) => {
+                                    // Send error response back to client
+                                    if let Err(send_err) = self
+                                        .framed
+                                        .send(RespDataType::SimpleError(e.to_string()))
+                                        .await
+                                    {
+                                        eprintln!("Failed to send error response: {}", send_err);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            eprintln!("Error decoding frame from {}: {:?}", self.remote_addr, e);
+                            break;
+                        }
+                        None => {
+                            // Connection closed by client
+                            println!("Connection from {} closed", self.remote_addr);
+                            break;
+                        }
+                    }
                 }
-                Err(e) => {
-                    eprintln!("Command error: {}", e);
-                    let _ = self
-                        .framed
-                        .send(RespDataType::SimpleError(e.to_string()))
-                        .await;
+
+                // Handle replica commands (only if this is a replica connection)
+                Some(replica_cmd) = async {
+                    match &mut self.replica_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await, // Never resolves if no replica_rx
+                    }
+                } => {
+                    // Handle replica-specific commands sent from the server
+                    match replica_cmd {
+                        ReplicaCommand::SendRdb => {
+                            self.send_rdb_file().await?;
+                        }
+                        ReplicaCommand::CommandProgation(cmd) => {
+                            // Broadcasted cmd from MASTER to REPLICA
+                            println!("Broadcasted to {}",self.remote_addr);
+                            let resp_enconded = RespDataType::from(cmd);
+                            self.framed.send(resp_enconded).await?;
+                        }
+                    }
                 }
             }
         }
@@ -271,22 +584,149 @@ impl Connection {
         Ok(())
     }
 
-    /// Processes a single command and responds to client
-    async fn process_command(&mut self, cmd: Command) -> Result<()> {
-        let mut resync_flag = false;
-        let response = if self.transaction_queue.is_some() {
-            self.handle_transaction_command(cmd).await
-        } else {
-            if let Command::PSYNC { .. } = cmd {
-                resync_flag = true;
-            };
-            self.handle_regular_command(cmd).await
-        };
+    async fn register_replica(&mut self) -> Result<()> {
+        let (replica_tx, replica_rx) = mpsc::unbounded_channel();
+        self.replica_rx = Some(replica_rx);
+        let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+        self.replica_id = Some(connection_id);
+        self.server_cmd_tx
+            .send(ServerCommand::RegisterReplica {
+                id: connection_id,
+                sender: replica_tx,
+            })
+            .await?;
+        Ok(())
+    }
 
-        self.framed.send(response).await?;
+    async fn handle_cmd(&mut self, cmd: Command) -> Result<()> {
+        println!("received {cmd:?}");
+        // Handle transaction control commands first
+        match &cmd {
+            Command::MULTI => {
+                // Check if we're already in a transaction
+                match self.execution_mode {
+                    ExecutionMode::Transaction { .. } => {
+                        self.framed
+                            .send(RespDataType::SimpleError(
+                                "ERR MULTI calls can not be nested".into(),
+                            ))
+                            .await?;
+                        return Ok(());
+                    }
+                    ExecutionMode::Normal => {
+                        // Start a new transaction
+                        self.execution_mode = ExecutionMode::Transaction {
+                            cmd_queue: Vec::new(),
+                        };
+                        self.framed
+                            .send(RespDataType::SimpleString("OK".into()))
+                            .await?;
+                        return Ok(());
+                    }
+                }
+            }
+            Command::EXEC => {
+                match std::mem::replace(&mut self.execution_mode, ExecutionMode::Normal) {
+                    ExecutionMode::Transaction { cmd_queue } => {
+                        if cmd_queue.is_empty() {
+                            self.framed.send(RespDataType::Array(vec![])).await?;
+                            return Ok(());
+                        }
 
-        if resync_flag {
-            self.send_rdb_file().await?;
+                        // Send all queued commands as a single transaction
+                        let (resp_tx, resp_rx) = oneshot::channel();
+                        let server_cmd = ServerCommand::Transaction {
+                            queued_cmds: cmd_queue, // Just send the raw commands
+                            resp: resp_tx,
+                        };
+
+                        self.server_cmd_tx.send(server_cmd).await?;
+                        let resp = resp_rx.await.expect("Transaction response channel closed");
+                        self.framed.send(resp).await?;
+                        return Ok(());
+                    }
+                    ExecutionMode::Normal => {
+                        self.framed
+                            .send(RespDataType::SimpleError("ERR EXEC without MULTI".into()))
+                            .await?;
+                        return Ok(());
+                    }
+                }
+            }
+            Command::DISCARD => {
+                match std::mem::replace(&mut self.execution_mode, ExecutionMode::Normal) {
+                    ExecutionMode::Transaction { .. } => {
+                        self.framed
+                            .send(RespDataType::SimpleString("OK".into()))
+                            .await?;
+                        return Ok(());
+                    }
+                    ExecutionMode::Normal => {
+                        self.framed
+                            .send(RespDataType::SimpleError(
+                                "ERR DISCARD without MULTI".into(),
+                            ))
+                            .await?;
+                        return Ok(());
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // Process command based on current execution mode
+        match &mut self.execution_mode {
+            ExecutionMode::Transaction { cmd_queue } => {
+                // Queue the command and send a QUEUED response
+                cmd_queue.push(cmd);
+                self.framed
+                    .send(RespDataType::SimpleString("QUEUED".into()))
+                    .await?;
+            }
+            ExecutionMode::Normal => {
+                // Normal command execution flow
+                let (resp_tx, resp_rx) = oneshot::channel();
+
+                let server_cmd = match cmd {
+                    // Storage related commands
+                    Command::GET { .. }
+                    | Command::SET { .. }
+                    | Command::RPUSH { .. }
+                    | Command::LRANGE { .. }
+                    | Command::LPUSH { .. }
+                    | Command::LLEN { .. }
+                    | Command::LPOP { .. }
+                    | Command::INCR { .. }
+                    | Command::BLPOP { .. } => ServerCommand::Storage { cmd, resp: resp_tx },
+
+                    // MISC Related commands
+                    Command::INFO { .. } | Command::PING | Command::ECHO(_) => {
+                        ServerCommand::Misc { cmd, resp: resp_tx }
+                    }
+
+                    // Replication related commands
+                    Command::REPLCONF { .. } | Command::PSYNC { .. } => {
+                        // Register as a replica if not already
+                        if self.replica_rx.is_none() {
+                            self.register_replica().await?;
+                        }
+                        ServerCommand::Replication {
+                            cmd,
+                            replica_id: self.replica_id.context("replica state uninitialized")?,
+                            resp: resp_tx,
+                        }
+                    }
+
+                    // Transaction commands should be handled above
+                    Command::MULTI | Command::EXEC | Command::DISCARD => {
+                        unreachable!("Transaction commands should be handled above")
+                    }
+                };
+
+                self.server_cmd_tx.send(server_cmd).await?;
+                let resp = resp_rx.await?;
+                self.framed.send(resp).await?;
+            }
         }
 
         Ok(())
@@ -298,7 +738,7 @@ impl Connection {
         let empty_rdb = include_bytes!("../empty.rdb");
 
         // Get the underlying TCP stream
-        let stream = self.framed.get_mut();
+        let stream = self.framed.get_mut(); // is this bypass ok?
 
         // Send RDB file in the format: $<length>\r\n<binary_contents>
         let rdb_response = format!("${}\r\n", empty_rdb.len());
@@ -306,96 +746,6 @@ impl Connection {
         stream.write_all(empty_rdb).await?;
         stream.flush().await?;
 
-        info!("Sent RDB file ({} bytes) to replica", empty_rdb.len());
         Ok(())
-    }
-
-    /// Handles commands when in transaction mode
-    async fn handle_transaction_command(&mut self, cmd: Command) -> RespDataType {
-        match cmd {
-            Command::EXEC => {
-                if let Some(mut queued_cmds) = self.transaction_queue.take() {
-                    if queued_cmds.is_empty() {
-                        RespDataType::Array(vec![])
-                    } else {
-                        self.execute_transaction(&mut queued_cmds).await
-                    }
-                } else {
-                    RespDataType::SimpleError("ERR EXEC without MULTI".into())
-                }
-            }
-            Command::DISCARD => {
-                self.transaction_queue = None;
-                RespDataType::SimpleString("OK".into())
-            }
-            _ => {
-                if let Some(ref mut queued_cmds) = self.transaction_queue {
-                    queued_cmds.push_back(cmd);
-                }
-                RespDataType::SimpleString("QUEUED".into())
-            }
-        }
-    }
-
-    /// Handles commands when not in transaction mode
-    async fn handle_regular_command(&mut self, cmd: Command) -> RespDataType {
-        match cmd {
-            Command::PING => RespDataType::SimpleString("PONG".to_string()),
-            Command::ECHO(msg) => RespDataType::BulkString(msg),
-            Command::MULTI => {
-                self.transaction_queue = Some(VecDeque::new());
-                RespDataType::SimpleString("OK".into())
-            }
-            Command::EXEC => RespDataType::SimpleError("ERR EXEC without MULTI".into()),
-            Command::DISCARD => RespDataType::SimpleError("ERR DISCARD without MULTI".into()),
-            Command::INFO { section: _ } => self.retrieve_info(),
-            Command::REPLCONF => RespDataType::SimpleString("OK".into()),
-            Command::PSYNC {
-                replication_id,
-                offset: _,
-            } => {
-                let current_offset = 0;
-                let my_id = DEFAULT_MASTER_ID;
-                RespDataType::SimpleString(format!("FULLRESYNC {} {}", my_id, current_offset))
-            }
-            _ => self.storage.send(cmd).await,
-        }
-    }
-
-    /// retrieves a BulkString like
-    /// $ redis-cli INFO replication
-    /// # Replication
-    /// role:master
-    /// connected_slaves:0
-    /// master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb
-    /// master_repl_offset:0
-    /// second_repl_offset:-1
-    /// repl_backlog_active:0
-    /// repl_backlog_size:1048576
-    /// repl_backlog_first_byte_offset:0
-    /// repl_backlog_histlen:
-    fn retrieve_info(&self) -> RespDataType {
-        let server_info = self.server_info.read().unwrap();
-        RespDataType::BulkString(server_info.to_string())
-    }
-
-    /// Executes a transaction by processing all queued commands
-    async fn execute_transaction(&self, queued_cmds: &mut VecDeque<Command>) -> RespDataType {
-        let mut results = Vec::with_capacity(queued_cmds.len());
-
-        while let Some(cmd) = queued_cmds.pop_front() {
-            let result = match cmd {
-                Command::PING => RespDataType::SimpleString("PONG".to_string()),
-                Command::ECHO(msg) => RespDataType::BulkString(msg),
-                Command::EXEC | Command::MULTI => {
-                    panic!("MULTI or EXEC should not be queued in a transaction")
-                }
-                _ => self.storage.send(cmd).await,
-            };
-
-            results.push(result);
-        }
-
-        RespDataType::Array(results)
     }
 }

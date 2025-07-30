@@ -60,6 +60,39 @@ pub enum Command {
     },
 }
 
+impl Command {
+    /// Determines if this command is a write operation that should be replicated to replicas.
+    /// Write commands modify the dataset and need to be propagated to maintain consistency.
+    pub fn is_write(&self) -> bool {
+        match self {
+            // Write operations that modify data
+            Command::SET { .. } => true,
+            Command::RPUSH { .. } => true,
+            Command::LPUSH { .. } => true,
+            Command::LPOP { .. } => true,
+            Command::BLPOP { .. } => true,
+            Command::INCR { .. } => true,
+
+            // Read operations that don't modify data
+            Command::PING => false,
+            Command::ECHO(_) => false,
+            Command::GET { .. } => false,
+            Command::LRANGE { .. } => false,
+            Command::LLEN { .. } => false,
+
+            // Transaction commands - EXEC might contain writes, but we handle this differently
+            Command::MULTI => false,
+            Command::EXEC => false,
+            Command::DISCARD => false,
+
+            // Administrative/replication commands that don't modify user data
+            Command::INFO { .. } => false,
+            Command::REPLCONF => false,
+            Command::PSYNC { .. } => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Section {
     Replication,
@@ -333,5 +366,98 @@ impl TryFrom<RespDataType> for Command {
             }
             _ => bail!("Command must be an array of RESP types"),
         }
+    }
+}
+
+impl From<Command> for RespDataType {
+    fn from(cmd: Command) -> Self {
+        use RespDataType::{Array, BulkString};
+        match cmd {
+            Command::PING => Array(vec![BulkString("PING".into())]),
+            Command::ECHO(msg) => Array(vec![BulkString("ECHO".into()), BulkString(msg)]),
+            Command::GET { key } => Array(vec![BulkString("GET".into()), BulkString(key)]),
+            Command::SET { key, val, px } => {
+                let mut arr = vec![BulkString("SET".into()), BulkString(key), BulkString(val)];
+                if let Some(duration) = px {
+                    arr.push(BulkString("PX".into()));
+                    arr.push(BulkString(duration.as_millis().to_string()));
+                }
+                Array(arr)
+            }
+            Command::RPUSH { key, elements } => {
+                let mut arr = vec![BulkString("RPUSH".into()), BulkString(key)];
+                arr.extend(elements.into_iter().map(BulkString));
+                Array(arr)
+            }
+            Command::LPUSH { key, elements } => {
+                let mut arr = vec![BulkString("LPUSH".into()), BulkString(key)];
+                arr.extend(elements.into_iter().map(BulkString));
+                Array(arr)
+            }
+            Command::LRANGE { key, start, stop } => Array(vec![
+                BulkString("LRANGE".into()),
+                BulkString(key),
+                BulkString(start.to_string()),
+                BulkString(stop.to_string()),
+            ]),
+            Command::LLEN { key } => Array(vec![BulkString("LLEN".into()), BulkString(key)]),
+            Command::LPOP { key, count } => {
+                let mut arr = vec![BulkString("LPOP".into()), BulkString(key)];
+                if let Some(n) = count {
+                    arr.push(BulkString(n.to_string()));
+                }
+                Array(arr)
+            }
+            Command::BLPOP { keys, timeout } => {
+                let mut arr = vec![BulkString("BLPOP".into())];
+                arr.extend(keys.into_iter().map(BulkString));
+                arr.push(BulkString(timeout.as_secs().to_string()));
+                Array(arr)
+            }
+            Command::INCR { key } => Array(vec![BulkString("INCR".into()), BulkString(key)]),
+            Command::MULTI => Array(vec![BulkString("MULTI".into())]),
+            Command::EXEC => Array(vec![BulkString("EXEC".into())]),
+            Command::DISCARD => Array(vec![BulkString("DISCARD".into())]),
+            Command::REPLCONF => Array(vec![BulkString("REPLCONF".into())]),
+            Command::PSYNC {
+                replication_id,
+                offset,
+            } => Array(vec![
+                BulkString("PSYNC".into()),
+                BulkString(replication_id),
+                BulkString(offset.to_string()),
+            ]),
+            Command::INFO { section } => {
+                let mut arr = vec![BulkString("INFO".into())];
+                if let Some(Section::Replication) = section {
+                    arr.push(BulkString("replication".into()));
+                }
+                Array(arr)
+            }
+        }
+    }
+}
+#[cfg(test)]
+mod test {
+    use bytes::BytesMut;
+
+    use crate::resp::RespDataType;
+
+    use super::Command;
+    // Helper function to create BytesMut from a string
+    fn bytes_from_str(s: &str) -> BytesMut {
+        BytesMut::from(s)
+    }
+
+    #[test]
+    fn from_set_cmd_to_resp() {
+        let cmd = Command::SET {
+            key: "foo".into(),
+            val: "bar".into(),
+            px: None,
+        };
+
+        let expected_result = bytes_from_str("*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+        assert_eq!(RespDataType::from(cmd).as_bytes(), expected_result);
     }
 }

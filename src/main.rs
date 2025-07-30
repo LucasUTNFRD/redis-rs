@@ -7,5 +7,8 @@ use codecrafters_redis::{config::ServerConfig, server::RedisServer};
 async fn main() -> Result<()> {
     let config = ServerConfig::from_cli();
     let server = RedisServer::new(config).await?;
-    server.run().await
+
+    server.run_event_loop().await?;
+
+    Ok(())
 }
